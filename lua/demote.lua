@@ -10,7 +10,7 @@
 --
 -- 降权效果的最终呈现由独立过滤器 lua/demote_filter.lua 完成（沉底/隐藏）。
 --
--- 配置（stroke_bg5cgq_learning.schema.yaml）：
+-- 配置（stroke_hspnv_learning.schema.yaml）：
 --   demote:
 --     key: "Control+Delete"   # 桌面触发键
 --     mode: demote            # demote=沉底（默认）；hide=直接隐藏
