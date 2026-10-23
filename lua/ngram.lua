@@ -1,7 +1,10 @@
--- BG5 n-gram v1：轻量级上下文联想模块
+-- BG5 n-gram v2：轻量级上下文联想模块（含标点 bigram）
 -- 为 segment_phrase 提供“上下文分”（cf），让笔画输入在连续输入时候选更精准：
 --   1. 词级 bigram：前一个上屏词 -> 下一个词（用于词组候选排序）
 --   2. 字级 bigram：前一个上屏词 -> 下一个词的首字（用于单字候选排序）
+--   3. 标点 bigram（v2 新增）：标点也作为合法上下文单元——
+--      「词 -> 标点」与「标点 -> 下一句首词」都会被学习，
+--      配合标点顶字实现「句子 -> 标点 -> 下一句预测」的连贯闭环。
 -- 数据保存在用户目录 bg5-ngram.user.tsv，配置在 schema 的 ngram: 段。
 
 local M = {}
@@ -45,6 +48,25 @@ local function chinese_only(s)
     if #ch < 3 or ch:byte() < 0x80 then return false end
   end
   return true
+end
+
+-- 标点集合：参与 bigram 的标点（与键盘标点键输出一致）
+local PUNCT_SET = {}
+for ch in ("，。？！、；：,.?!;:"):gmatch("[\1-\127\194-\244][\128-\191]*") do
+  PUNCT_SET[ch] = true
+end
+
+local function is_punct(s)
+  if not s or s == '' then return false end
+  local chars = utf8_chars(s)
+  return #chars == 1 and PUNCT_SET[chars[1]] == true
+end
+
+-- 合法的 n-gram 单元：纯中文 或 单个标点
+local function is_valid_unit(s)
+  if not s or s == '' then return false end
+  if is_punct(s) then return true end
+  return chinese_only(s)
 end
 
 local function load_config(env)
@@ -124,16 +146,37 @@ function M.char_freq(prev, ch, env)
   return 0
 end
 
+-- 最近一次上屏文本（含标点；若无标点则为纯中文）
+-- 供 predict_next 在句号后预测下一句开头词。
 function M.get_last_commit()
   return last_commit
+end
+M.get_last_text = M.get_last_commit
+
+-- 获取某个前词在用户历史中的所有后接词（按次数降序）
+-- 供 predict_next（上屏自动预测增强）把用户个性化搭配直接作为候选输出。
+function M.next_words(prev, env)
+  load(env)
+  if not ENABLED or not prev or prev == '' then return {} end
+  local prefix = prev .. '\t'
+  local out = {}
+  for k, n in pairs(data) do
+    if k:sub(1, #prefix) == prefix then
+      out[#out + 1] = { word = k:sub(#prefix + 1), cnt = n }
+    end
+  end
+  table.sort(out, function(a, b) return a.cnt > b.cnt end)
+  return out
 end
 
 local function learn_pair(prev, cur)
   if not prev or prev == '' or not cur or cur == '' then return end
-  if not chinese_only(prev) or not chinese_only(cur) then return end
+  -- 至少一方是中文词/字；不允许「标点 -> 标点」
+  if not is_valid_unit(prev) or not is_valid_unit(cur) then return end
+  if is_punct(prev) and is_punct(cur) then return end
   local wk = prev .. '\t' .. cur
   data[wk] = (data[wk] or 0) + 1
-  -- 记录 前词 -> 当前词首字
+  -- 记录 前词 -> 当前词首字（标点也记录其本身作为“首字”，供 char_freq 查询）
   local chars = utf8_chars(cur)
   local first = chars[1]
   if first then
@@ -151,7 +194,8 @@ function M.attach(env)
   if env._bg5_ngram_connected then return true end
   local function on_commit(ctx)
     local text = ctx:get_commit_text() or ''
-    if text ~= '' and chinese_only(text) then
+    -- 纯中文词或标点都参与上下文学习
+    if text ~= '' and is_valid_unit(text) then
       if prev_commit and prev_commit ~= text then
         learn_pair(prev_commit, text)
       end
