@@ -7,6 +7,9 @@
 -- 6. 时间衰减遗忘机制（v11 新增）：长期未使用的字/词按半衰期自动降权，
 --    衰减到 0 的条目彻底遗忘（清除），避免选错的词永远占据高位，
 --    使笔画方案具备类似万象的双向调频能力（自动加权 + 时间降权）。
+-- 7. 用户词频极端保护（v12 新增）：借鉴讯飞 UsrWordExtremeInfo 思路，
+--    用户词频设置上限 MAX_UF，防止连续上屏导致频次无限增长、长期霸榜；
+--    高频保护下限 MIN_FREQ 同步降低，与上限匹配（衰减到下限即停止）。
 
 local M = {}
 local loaded = false
@@ -20,7 +23,8 @@ local save_counter = 0
 local SAVE_INTERVAL = 4     -- 每 4 次上屏合并落盘一次，减少写盘卡顿
 local HALF_LIFE_DAYS = 30   -- 半衰期：30 天未使用，权重减半
 local DECAY_MIN_ELAPSED = 86400   -- 至少间隔 1 天（86400 秒）才执行一次衰减
-local MIN_FREQ = 100        -- 衰减下限：上屏频次达到该值的词，衰减到此即停止（高频词保护）
+local MIN_FREQ = 8          -- 衰减下限：上屏频次达到该值的词，衰减到此即停止（高频词保护）
+local MAX_UF = 10           -- 用户词频上限：单条用户词累计频次封顶，防止霸榜（极端保护）
 local last_decay_time = 0
 
 -- 偏旁部首不参与学习：必须完整码输入才出现在候选区，不能通过学习调频。
@@ -202,12 +206,12 @@ function M.has_prefix(prefix, env)
   return learned_prefix[prefix] == true
 end
 
--- 累加频次并更新时间戳（新词则创建）
+-- 累加频次并更新时间戳（新词则创建）；频次封顶 MAX_UF，防止用户词无限增长霸榜。
 local function touch(w)
   local now = os.time()
   local item = data[w]
   if item then
-    item.cnt = item.cnt + 1
+    item.cnt = math.min(item.cnt + 1, MAX_UF)
     item.last = now
   else
     data[w] = { cnt = 1, last = now }
