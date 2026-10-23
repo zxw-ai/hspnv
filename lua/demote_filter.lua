@@ -5,7 +5,7 @@
 -- 数据：用户目录 demote.user.tsv（由 lua/demote.lua 处理器写入），每行 词<TAB>时间戳
 -- 每次过滤都重新读取文件，确保处理器刚降权的词立即生效（不依赖模块共享状态）。
 --
--- 配置（stroke_bg5cgq_learning.schema.yaml 的 demote: 段）：
+-- 配置（stroke_hspnv_learning.schema.yaml 的 demote: 段）：
 --   mode: demote   # demote=沉底（默认）；hide=直接隐藏
 
 local DEMOTE_FILE = 'demote.user.tsv'
