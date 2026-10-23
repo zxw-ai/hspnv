@@ -1,7 +1,7 @@
 # Rime dictionary
 # encoding: utf-8
 #
-# 笔画码 custom_phrase 大词表版（直接用于 BG5CGQ 笔画方案）
+# 笔画码 custom_phrase 大词表版（直接用于 hspnv 笔画方案）
 # 编码：数字 1-5 = 横 竖 撇 点/捺 折
 #   全码    ：整词每个字的完整笔画码拼接（精确匹配）
 #   首笔简码：每个字第一笔的编码拼接（配合 enable_completion 前缀联想）
