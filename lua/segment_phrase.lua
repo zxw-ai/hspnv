@@ -33,8 +33,34 @@ local unigram_fallback = require('unigram_fallback')
 -- 用户频次权重步长（调整排序平衡）：
 -- WORD_UF_STEP：词候选排序中，用户上屏 1 次 ≈ 词库词频 30000（原 100000，避免一次误选就霸榜）
 -- CHAR_UF_STEP：单字候选排序中，用户上屏 1 次 ≈ 静态字频 5000（原直接相加，权重过低，个性化不足）
-local WORD_UF_STEP = 30000
-local CHAR_UF_STEP = 5000
+-- =============================================================================
+-- 候选重排权重表（路线4：排序流水线显式化，借鉴讯飞 ResultScore/ResultSort 分层）
+-- 所有排序因子统一收敛到本表，后续调优只改这里：
+--   uf_step      词级：用户上屏 1 次 ≈ 静态词频的步长
+--   char_uf_step 字级：用户上屏 1 次 ≈ 静态字频的步长
+--   connector    衔接词固定加分（键道「衔接词优先」）
+--   sf_generic   通用后接词兜底分（无历史时的常用起句词）
+--   sf_bigram    离线 bigram 预测分（next_words_big/next_words）
+--   sf_assoc      高频短语/句子联想分（phrase_assoc）
+--   sf_open      分词后开放联想分（emit_open_continuation）
+--   sf_tri       三连联想分（连续上屏两词后，next_words_tri/phrase_assoc_tri）
+--   sf_quad       四连联想分（phrase_assoc_quad）
+--   sf_tailword  末尾字组词联想分
+-- =============================================================================
+local WEIGHTS = {
+  uf_step      = 30000,
+  char_uf_step = 5000,
+  connector    = 20000,
+  sf_generic   = 200000,
+  sf_bigram    = 300000,
+  sf_assoc     = 450000,
+  sf_open      = 520000,
+  sf_tri       = 500000,
+  sf_quad      = 550000,
+  sf_tailword  = 150000,
+}
+local WORD_UF_STEP = WEIGHTS.uf_step
+local CHAR_UF_STEP = WEIGHTS.char_uf_step
 -- 分词联想上限：预编辑区超过 N 个分词符时不再联想更长词（防爆上限）
 local MAX_WORD_LEN = 8
 
@@ -71,6 +97,47 @@ end
 local function fuzzy_code(s)
   if not fuzzy_stroke_on then return s end
   return s:gsub("[25]", "X")
+end
+
+-- =============================================================================
+-- 局部纠错表（路线3，借鉴讯飞 add_cor_in_segment 音节段纠错）：
+-- 只对「高频易混笔画对」做单位置替换纠错，作为全局模糊笔画（fuzzy_stroke）的补充。
+-- 与全局模糊的区别：
+--   fuzzy_stroke：把整码 2/5 统一归一（候选集变大，噪音较多）
+--   correction  ：只生成"把某一位替换成易混笔画"的变体码，命中字以 rank=1500
+--                 （精确 0 < 纠错 1500 < 前缀桶 2000+）插入候选，精确码永远优先。
+-- 可通过 schema option correction_stroke 开关（默认开），与 fuzzy_stroke 并存。
+-- =============================================================================
+local CORRECTION_PAIRS = {
+  { "2", "5" }, { "5", "2" },  -- 竖 2 ↔ 折 5（最高频混淆）
+  { "3", "4" }, { "4", "3" },   -- 撇 3 ↔ 点 4（次高频）
+}
+local correction_stroke_on = true
+
+-- 生成 seg 的所有「单位置易混替换」变体码（去重）
+local function correction_variants(seg)
+  local chars = {}
+  for ch in seg:gmatch("[12345]") do
+    chars[#chars + 1] = ch
+  end
+  if #chars < 2 then return {} end
+  local variants = {}
+  local seen = {}
+  for i, ch in ipairs(chars) do
+    for _, pair in ipairs(CORRECTION_PAIRS) do
+      if ch == pair[1] then
+        local clone = {}
+        for j = 1, #chars do clone[j] = chars[j] end
+        clone[i] = pair[2]
+        local v = table.concat(clone)
+        if not seen[v] then
+          seen[v] = true
+          variants[#variants + 1] = v
+        end
+      end
+    end
+  end
+  return variants
 end
 
 -- 笔画前缀匹配：支持通配符 ?（匹配任意一笔 1-5）
@@ -488,6 +555,20 @@ local function chars_for(seg, env)
   if exact_list then
     for _, ch in ipairs(exact_list) do
       add_char(ch, true, 0)
+    end
+  end
+
+  -- 1.5 局部纠错候选（路线3）：易混笔画单位置替换的精确命中字，作为补充
+  -- rank=1500：精确(0) < 纠错(1500) < 普通前缀桶(2000+)，精确码永远优先。
+  if correction_stroke_on then
+    local variants = correction_variants(seg)
+    for _, var in ipairs(variants) do
+      local corr_list = exact_stroke[var]
+      if corr_list then
+        for _, ch in ipairs(corr_list) do
+          add_char(ch, false, 1500)
+        end
+      end
     end
   end
 
@@ -1175,7 +1256,7 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
     for i = 1, math.min(#quad_hits, 3) do
       local w = quad_hits[i]
       if not found[w] then
-        found[w] = {sf = 520000 - i * 1000, uf = learning.freq(w, env), cf = ngram.word_freq(last, w, env)}
+        found[w] = {sf = WEIGHTS.sf_open - i * 1000, uf = learning.freq(w, env), cf = ngram.word_freq(last, w, env)}
       end
     end
   end
@@ -1292,7 +1373,7 @@ local function build_predict_continuations(env)
   local prev2_ctx = learning.get_prev2_commit()
   local prev3_ctx = learning.get_prev3_commit()
   -- 键道「衔接词优先」：高频功能/衔接词在联想排序中给予固定加分，让候选更顺口
-  local CONNECTOR_BONUS = 20000
+  local CONNECTOR_BONUS = WEIGHTS.connector
   local CONNECTORS = {
     ["的"]=true,["了"]=true,["是"]=true,["在"]=true,["有"]=true,["和"]=true,
     ["就"]=true,["都"]=true,["也"]=true,["不"]=true,["很"]=true,["要"]=true,
@@ -1318,7 +1399,7 @@ local function build_predict_continuations(env)
   -- 任意词上屏后都有可接的通用后接词（数据驱动 unigram 兜底，替代固定虚词）。
   local generic = unigram_fallback
   for i, w in ipairs(generic) do
-    found[w] = {sf = 200000 - i * 100, uf = learning.freq(w, env), cf = cf_of(w)}
+    found[w] = {sf = WEIGHTS.sf_generic - i * 100, uf = learning.freq(w, env), cf = cf_of(w)}
   end
 
   -- 0. 三连联想（最高优先）：连续上屏两个词后，用离线预训练 trigram 预测第三个词
@@ -1332,7 +1413,7 @@ local function build_predict_continuations(env)
     if tri_list then
       for rank, w in ipairs(tri_list) do
         local uf = learning.freq(w, env)
-        found[w] = {sf = 500000 - (rank * 1000), uf = uf, cf = cf_of(w)}
+        found[w] = {sf = WEIGHTS.sf_tri - (rank * 1000), uf = uf, cf = cf_of(w)}
       end
     end
   end
@@ -1344,7 +1425,7 @@ local function build_predict_continuations(env)
     if quad_list then
       for rank, w in ipairs(quad_list) do
         local uf = learning.freq(w, env)
-        found[w] = {sf = 550000 - (rank * 1000), uf = uf, cf = cf_of(w)}
+        found[w] = {sf = WEIGHTS.sf_quad - (rank * 1000), uf = uf, cf = cf_of(w)}
       end
     end
   end
@@ -1354,7 +1435,7 @@ local function build_predict_continuations(env)
   if assoc_list then
     for rank, w in ipairs(assoc_list) do
       local uf = learning.freq(w, env)
-      found[w] = {sf = 450000 - (rank * 1000), uf = uf, cf = cf_of(w)}
+      found[w] = {sf = WEIGHTS.sf_assoc - (rank * 1000), uf = uf, cf = cf_of(w)}
     end
   end
 
@@ -1363,7 +1444,7 @@ local function build_predict_continuations(env)
   if nxt_list then
     for rank, w in ipairs(nxt_list) do
       local uf = learning.freq(w, env)
-      found[w] = {sf = 300000 - (rank * 1000), uf = uf, cf = cf_of(w)}
+      found[w] = {sf = WEIGHTS.sf_bigram - (rank * 1000), uf = uf, cf = cf_of(w)}
     end
   end
 
@@ -1405,8 +1486,8 @@ local function build_predict_continuations(env)
           local second = w:sub(4, 6)
           local wf = words[w] or 0
           local old = found[second]
-          if not old or (150000 + wf) > (old.sf or 0) then
-            found[second] = {sf = 150000 + wf, uf = learning.freq(second, env), cf = cf_of(second)}
+          if not old or (WEIGHTS.sf_tailword + wf) > (old.sf or 0) then
+            found[second] = {sf = WEIGHTS.sf_tailword + wf, uf = learning.freq(second, env), cf = cf_of(second)}
           end
         end
       end
@@ -1470,6 +1551,17 @@ local function translator(input, seg, env)
     local nf = env.engine.context:get_option("fuzzy_stroke") or false
     if nf ~= fuzzy_stroke_on then
       fuzzy_stroke_on = nf
+      cache[env] = {}
+      phrase_cache = {}
+    end
+  end
+
+  -- 更新局部纠错开关（路线3，切换时清空相关缓存）
+  if env.engine and env.engine.context then
+    local nc = env.engine.context:get_option("correction_stroke")
+    if nc == nil then nc = true end
+    if nc ~= correction_stroke_on then
+      correction_stroke_on = nc
       cache[env] = {}
       phrase_cache = {}
     end
