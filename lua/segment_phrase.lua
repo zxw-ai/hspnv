@@ -1534,6 +1534,8 @@ local function build_predict_continuations(env)
   for s in pairs(found) do
     if recent_set[s] and not strong_set[s] then
       found[s].sf = math.floor((found[s].sf or 0) / 2)
+      -- 同时削弱用户频次：避免「上屏过的词因刚被调频而永远第一」导致连打卡死
+      found[s].uf = math.floor((found[s].uf or 0) / 2)
     end
     order[#order + 1] = s
   end
