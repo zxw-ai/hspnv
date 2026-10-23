@@ -1448,6 +1448,25 @@ local function build_predict_continuations(env)
     end
   end
 
+  -- 1.1 用户 bigram 直出（路线A/C）：用户历史中 last->X 的后接词直接作为候选。
+  --     即使 X 不在静态联想表（如「句号 -> 下一句首词」）也能被预测；
+  --     权重略高于静态 bigram（sf_bigram+50000），低于三连/短语联想。
+  if last and last ~= '' and type(ngram.next_words) == 'function' then
+    local ok_uw, user_list = pcall(function() return ngram.next_words(last, env) end)
+    if ok_uw and type(user_list) == 'table' then
+      for rank, item in ipairs(user_list) do
+        local w = item.word
+        if w and w ~= '' and not found[w] then
+          found[w] = {
+            sf = WEIGHTS.sf_bigram + 50000 - (rank - 1) * 1000,
+            uf = learning.freq(w, env),
+            cf = cf_of(w),
+          }
+        end
+      end
+    end
+  end
+
   -- 2. 从 head_words 中截取后缀作为词内补全候选
   local first_ch = utf8_first_char(last)
   local bucket = head_words[first_ch] or {}
@@ -1495,14 +1514,28 @@ local function build_predict_continuations(env)
   end
 
   local order = {}
-  -- 排除最近上屏过的 6 个词（避免连打循环重复）
+  -- 动态循环抑制（路线C）：最近上屏过的 6 个词不再「一刀切排除」，
+  -- 而是默认降权（sf 减半，仍可出现在候选列表靠后）；
+  -- 若用户 bigram 中有「last -> 该词」的真实搭配记录，则不降权（允许真实重复搭配）。
   local recent = learning.get_recent_commits() or {}
   local recent_set = {}
   for i = math.max(1, #recent - 5), #recent do
     recent_set[recent[i]] = true
   end
+  local strong_set = {}
+  if last and last ~= '' and type(ngram.next_words) == 'function' then
+    local ok_uw, user_list = pcall(function() return ngram.next_words(last, env) end)
+    if ok_uw and type(user_list) == 'table' then
+      for _, item in ipairs(user_list) do
+        strong_set[item.word] = true
+      end
+    end
+  end
   for s in pairs(found) do
-    if not recent_set[s] then order[#order + 1] = s end
+    if recent_set[s] and not strong_set[s] then
+      found[s].sf = math.floor((found[s].sf or 0) / 2)
+    end
+    order[#order + 1] = s
   end
   -- 个性化联想提权：用户上屏频次 uf 以大步长参与排序（1 次上屏 ≈ 1 次 ngram 上下文命中）
   local UF_STEP = WORD_UF_STEP
@@ -1659,8 +1692,17 @@ end
 
 -- 返回表：librime-lua 的 lua_translator 调用表的 func 字段；
 -- 同时导出联想候选生成函数，供 predict_space（空格连打）等模块复用。
+-- 可选参数 last_override：外部传入的预测上下文（可含标点，如「。」），
+-- 用于路线A（连打 fallback 的句号后预测）；不传则行为与旧版完全一致。
 M.func = translator
-M.get_predict_continuations = function(env)
+M.get_predict_continuations = function(env, last_override)
+  if last_override and last_override ~= '' then
+    local saved = learning.get_last_commit()
+    learning.set_last_commit(last_override)
+    local out = build_predict_continuations(env)
+    learning.set_last_commit(saved)
+    return out
+  end
   return build_predict_continuations(env)
 end
 return M
