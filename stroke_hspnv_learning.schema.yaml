@@ -23,6 +23,9 @@ switches:
   - name: fuzzy_stroke
     reset: 0
     states: [标准笔画, 模糊笔画]
+  - name: correction_stroke
+    reset: 1
+    states: [纠错关, 纠错开]
   - options: [s2s, s2t, s2hk, s2tw]
     states: [简体, 通繁, 港繁, 臺繁]
 
@@ -31,6 +34,7 @@ engine:
     - lua_processor@*wanxiang.context_reorder*P  # 上下文调频
     - lua_processor@*wanxiang.super_sequence*P   # 手动排序：Ctrl+j 上移 / Control+k 下移 / Ctrl+l 重置 / Ctrl+p 置顶（对应皮肤「下移」「降权」键）
     - lua_processor@*auto_commit                  # 自动上屏（键道顶功模式）：唯一候选在下一键时自动上屏
+    - lua_processor@*punct_commit                  # 标点顶字：按标点键时先提交高亮候选再上屏标点（连续成句）
     - lua_processor@*select_character           # 以词定字：皮肤「首」键(\=backslash)取首字 / 「尾」键(;=semicolon)取末字
     - lua_processor@*demote                     # 手动降权：对当前高亮候选降频（皮肤「降权」键点击发送 Control+Delete）
     - lua_processor@*predict_space               # 连打键上屏联想：上屏后按「连打」键(Tab)直接上屏联想候选（万象机制）
@@ -67,6 +71,7 @@ engine:
     - lua_filter@*long_word_filter               # 长词优先（短码输入时多字词提前）
     - lua_filter@*demote_filter                     # 手动降权：降权词沉底/隐藏（任意候选生效）
     - uniquifier                                   # 去重
+    - lua_filter@*predict_next                     # 上屏自动预测增强：用户 bigram 直出 + 输入中融合 + 可选超时
 
 speller:
   alphabet: "12345?'V"
@@ -99,6 +104,17 @@ ngram:
   word_cap: 3            # 词级上下文分上限（相当于最多 3 次用户频次）
   char_weight: 100000    # 字级上下文分步长
   char_cap: 2            # 字级上下文分上限
+
+# 上屏自动预测增强（候选输出状态机 + 混合候选）
+predict_next:
+  enable: true            # 总开关（false 时过滤器完全透传）
+  expire_seconds: 0        # 0=空输入预测不超时；>0 表示 commit 后 N 秒不再显示预测（候选区留白）
+  inputting_fusion: true   # 输入中：用户历史词前缀融合（打下一字时提前命中）
+  mix_kaomoji: true        # 空输入预测末尾追加颜文字（路线 G 混合候选）
+
+# 标点顶字（路线 C）：按标点键先提交高亮候选，再上屏标点
+punct_commit:
+  enable: true
 
 # 自定义置顶词（custom_phrase.dict.yaml，编码需用笔画数字码 1-5）
 # enable_completion: true 开启前缀联想（输入前几笔也能出候选）；max_candidates 限制输出量防止候选爆炸
