@@ -45,6 +45,34 @@ function M.init(env)
   end
 end
 
+-- 路线B：连打置信度保护
+-- 只有满足任一条件才直接上屏：
+--   1. 用户学习库有该词频次（真实上屏过）
+--   2. 用户 bigram 中有 last→text 记录
+--   3. 静态词库权重 >= CONFIDENCE_STATIC_WEIGHT
+-- 否则只刷新候选区（用户可见候选，方向键选择后确认），避免误上屏冷门词。
+local CONFIDENCE_STATIC_WEIGHT = 500
+local function confident_enough(learning, last, text, env)
+  if not text or text == '' then return false end
+  -- 1. 用户学习库有频次
+  if learning and learning.freq then
+    local ok_f, f = pcall(function() return learning.freq(text, env) end)
+    if ok_f and f and f > 0 then return true end
+  end
+  -- 2. 用户 bigram 有 last→text 记录
+  if last and last ~= '' then
+    local ok_n, ngram = pcall(require, 'ngram')
+    if ok_n and type(ngram.word_freq) == 'function' then
+      local ok_c, cf = pcall(function() return ngram.word_freq(last, text, env) end)
+      if ok_c and cf and cf > 0 then return true end
+    end
+  end
+  -- 3. 静态词库权重足够
+  local ok_w, words = pcall(require, 'words')
+  if ok_w and words[text] and words[text] >= CONFIDENCE_STATIC_WEIGHT then return true end
+  return false
+end
+
 function M.func(key_event, env)
   -- 只处理连打键（默认回车 Return；不再拦截空格，空格保持 Rime 原生行为）
   if key_event.keycode ~= (env.predict_keycode or 0xFF0D) then return 2 end
@@ -86,10 +114,17 @@ function M.func(key_event, env)
   -- 2. 原生失败（placeholder 段候选不可用）：用我们自己的联想模型生成下一个词
   --    共享实例挂在 env.engine 上；require 可能返回隔离新实例（状态为空）
   local seg_phrase = (env.engine and env.engine.bg5_segment_phrase) or env.bg5_segment_phrase or require('segment_phrase')
+  -- 路线A：预测上下文优先用 ngram 的「含标点」最近上屏（支持 句号→下一句首词）
+  local last_override = ''
+  local ok_ng, ngram = pcall(require, 'ngram')
+  if ok_ng and type(ngram.get_last_text) == 'function' then
+    local ok_l, v = pcall(function() return ngram.get_last_text() end)
+    if ok_l and v then last_override = v end
+  end
   local text = nil
   if seg_phrase and seg_phrase.get_predict_continuations then
     local ok, list = pcall(function()
-      return seg_phrase.get_predict_continuations(env)
+      return seg_phrase.get_predict_continuations(env, last_override)
     end)
     if ok and list and list[1] and list[1] ~= '' then
       text = list[1]
@@ -97,11 +132,14 @@ function M.func(key_event, env)
   end
 
   if text then
-    -- 上屏联想词
-    pcall(function() ctx:commit_text(text) end)
-    -- 更新联想上下文（learning 记录刚上屏的词）
-    pcall(function() learning.notify_commit(text, env) end)
-    -- 触发候选刷新（万象机制：虚拟 option 触发 update notifier）
+    -- 路线B：置信度保护——用户学过 / 用户 bigram 有记录 / 静态词频够高 才直接上屏
+    if confident_enough(learning, last_override, text, env) then
+      -- 上屏联想词
+      pcall(function() ctx:commit_text(text) end)
+      -- 更新联想上下文（learning 记录刚上屏的词）
+      pcall(function() learning.notify_commit(text, env) end)
+    end
+    -- 无论是否上屏都刷新候选区：置信度不足时用户可见候选，可方向键选择后确认
     env._predict_space_pending = true
     pcall(function() ctx:set_option('_dummy_predict_update', true) end)
   end
