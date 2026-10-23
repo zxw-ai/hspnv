@@ -185,6 +185,35 @@ local function learn_pair(prev, cur)
   end
 end
 
+-- 仅更新上下文（不学习、不写盘）：供 predict_space 连打上屏「通用兜底词」时使用，
+-- 避免兜底词（的/了/吧/啊/是）污染用户 bigram 导致连打反复上屏同一词。
+function M.touch_context(text, env)
+  load(env)
+  if not text or text == '' then return end
+  if not is_valid_unit(text) then return end
+  prev_commit = text
+  last_commit = text
+end
+
+-- 手动提交通知（供 predict_space 在 commit_text 后调用）
+-- commit_text 不触发 commit_notifier，若不手动更新，ngram 上下文不会推进，
+-- 「句号->下一句」链路在纯 fallback 连打时会断。
+function M.notify_commit(text, env)
+  load(env)
+  if not text or text == '' then return end
+  if not is_valid_unit(text) then return end
+  if prev_commit and prev_commit ~= text then
+    learn_pair(prev_commit, text)
+  end
+  prev_commit = text
+  last_commit = text
+  save_counter = save_counter + 1
+  if save_counter >= SAVE_INTERVAL then
+    save_counter = 0
+    save()
+  end
+end
+
 function M.attach(env)
   if not env or not env.engine or not env.engine.context then return false end
   load(env)
