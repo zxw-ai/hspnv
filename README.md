@@ -50,8 +50,8 @@
 ## 📦 仓库结构
 
 ```
-├── stroke_bg5cgq_learning.schema.yaml   # 主方案配置
-├── stroke_bg5cgq.dict.yaml               # 笔画码表（白霜词库转笔画码）
+├── stroke_hspnv_learning.schema.yaml   # 主方案配置
+├── stroke_hspnv.dict.yaml               # 笔画码表（白霜词库转笔画码）
 ├── custom_phrase*.dict.yaml              # 自定义置顶词
 ├── 使用说明.md                           # 完整使用文档（13 章）
 ├── lua/
@@ -70,7 +70,7 @@
 
 ## 🚀 安装部署
 
-1. 将本仓库方案文件（`stroke_bg5cgq_learning.schema.yaml`、`stroke_bg5cgq.dict.yaml`、`lua/` 等）复制到元书的 Rime 用户目录
+1. 将本仓库方案文件（`stroke_hspnv_learning.schema.yaml`、`stroke_hspnv.dict.yaml`、`lua/` 等）复制到元书的 Rime 用户目录
 2. 导入皮肤：元书 → 设置 → 皮肤 → 导入 `多功能大包-计算版-v106-以词定字.cskin`
 3. 在元书中**重新部署方案**（首次加载词库约 10 秒，一次性）
 
