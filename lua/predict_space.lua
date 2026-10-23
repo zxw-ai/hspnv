@@ -70,6 +70,14 @@ local function confident_enough(learning, last, text, env)
   -- 3. 静态词库权重足够
   local ok_w, words = pcall(require, 'words')
   if ok_w and words[text] and words[text] >= CONFIDENCE_STATIC_WEIGHT then return true end
+  -- 4. 通用兜底后接词（unigram_fallback）视为可信：
+  --    它们是精心设计的句子接续词（的/了/吧/啊/是...），虽无用户记录但应放行连打。
+  local ok_u, ufb = pcall(require, 'unigram_fallback')
+  if ok_u and type(ufb) == 'table' then
+    for _, w2 in ipairs(ufb) do
+      if w2 == text then return true end
+    end
+  end
   return false
 end
 
@@ -133,11 +141,36 @@ function M.func(key_event, env)
 
   if text then
     -- 路线B：置信度保护——用户学过 / 用户 bigram 有记录 / 静态词频够高 才直接上屏
-    if confident_enough(learning, last_override, text, env) then
+    -- 置信度上下文：优先含标点的 last_override，否则退回 learning 的纯中文 last
+    local conf_last = last_override
+    if conf_last == '' then
+      local ok_lc, lc = pcall(function() return learning.get_last_commit() or '' end)
+      if ok_lc then conf_last = lc end
+    end
+    if confident_enough(learning, conf_last, text, env) then
       -- 上屏联想词
       pcall(function() ctx:commit_text(text) end)
-      -- 更新联想上下文（learning 记录刚上屏的词）
-      pcall(function() learning.notify_commit(text, env) end)
+      -- 更新联想上下文：通用兜底词只更新上下文不调频（避免污染用户词库导致连打卡死），
+      -- 其余词正常学习（用户真实搭配进入词库）。
+      local is_fallback_word = false
+      local ok_u, ufb = pcall(require, 'unigram_fallback')
+      if ok_u and type(ufb) == 'table' then
+        for _, w2 in ipairs(ufb) do
+          if w2 == text then is_fallback_word = true break end
+        end
+      end
+      if is_fallback_word then
+        pcall(function() learning.touch_context(text, env) end)
+        if ok_ng and type(ngram.touch_context) == 'function' then
+          pcall(function() ngram.touch_context(text, env) end)
+        end
+      else
+        pcall(function() learning.notify_commit(text, env) end)
+        -- 同步更新 ngram 上下文（commit_text 不触发 commit_notifier，需手动）
+        if ok_ng and type(ngram.notify_commit) == 'function' then
+          pcall(function() ngram.notify_commit(text, env) end)
+        end
+      end
     end
     -- 无论是否上屏都刷新候选区：置信度不足时用户可见候选，可方向键选择后确认
     env._predict_space_pending = true
