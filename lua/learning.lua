@@ -274,6 +274,28 @@ function M.set_last_commit(text)
   last_commit = text
 end
 
+-- 仅更新联想上下文（不调频、不写盘）：供 predict_space 连打上屏「通用兜底词」时使用，
+-- 避免 unigram_fallback 的接续词（的/了/吧/啊/是）污染用户学习库导致连打卡死。
+function M.touch_context(text, env)
+  load(env)
+  if not text or text == '' then return end
+  if not chinese_only(text) then return end
+  prev3_commit = prev2_commit
+  prev2_commit = prev_commit
+  prev_commit = text
+  last_commit = text
+  -- 维护最近上屏历史（去重：若已存在则移到末尾；限 12 个）
+  for i = #recent_commits, 1, -1 do
+    if recent_commits[i] == text then
+      table.remove(recent_commits, i)
+    end
+  end
+  recent_commits[#recent_commits + 1] = text
+  if #recent_commits > 12 then
+    table.remove(recent_commits, 1)
+  end
+end
+
 -- 手动提交通知：供 predict_space（空格连打）在 commit_text 后调用，
 -- 模拟正常 commit 的联想上下文更新（last/prev/prev2/prev3 + 组合造词 + 调频）。
 -- 因为 commit_text 不触发 commit_notifier，若不手动更新，下一轮联想不会生成。
