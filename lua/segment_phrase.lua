@@ -1752,4 +1752,30 @@ M.get_predict_continuations = function(env, last_override)
   end
   return build_predict_continuations(env)
 end
+
+-- 高置信首位自动上屏辅助（对标讯飞 p_autoSelectAllIfNeed）：
+-- 输入为「完整笔画码」（无分词符/通配符）时，返回候选区首位普通候选文本，
+-- 以及它在「同码精确候选」中的权重占比（置信度 0~1）。
+-- 权重口径与 chars_for 排序一致：learning.freq * CHAR_UF_STEP + char_freq。
+-- 供 auto_commit 处理器判断：即使候选不唯一，首位置信度 >= 阈值也可自动上屏。
+-- 非完整码/无精确候选/总权重为 0 时返回 nil（不触发）。
+M.get_auto_select_first = function(input, env)
+  if not input or input == '' then return nil end
+  if not input:match("^[12345]+$") then return nil end
+  local chars = chars_for(input, env)
+  if not chars or #chars == 0 then return nil end
+  local first = nil
+  local total = 0
+  for _, item in ipairs(chars) do
+    if item.exact and not item.component and not item.stroke_symbol then
+      local w = (learning.freq(item.ch, env) or 0) * CHAR_UF_STEP + (char_freq[item.ch] or 0)
+      total = total + w
+      if not first then
+        first = { text = item.ch, w = w }
+      end
+    end
+  end
+  if not first or total <= 0 then return nil end
+  return { text = first.text, conf = first.w / total }
+end
 return M
