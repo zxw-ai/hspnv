@@ -26,6 +26,9 @@ switches:
   - name: correction_stroke
     reset: 1
     states: [纠错关, 纠错开]
+  - name: high_conf_auto_select
+    reset: 1
+    states: [仅唯一候选, 高置信首位]   # 对标讯飞 p_autoSelectAllIfNeed：首位置信度>=阈值时自动上屏
   - options: [s2s, s2t, s2hk, s2tw]
     states: [简体, 通繁, 港繁, 臺繁]
 
@@ -33,7 +36,7 @@ engine:
   processors:
     - lua_processor@*wanxiang.context_reorder*P  # 上下文调频
     - lua_processor@*wanxiang.super_sequence*P   # 手动排序：Ctrl+j 上移 / Control+k 下移 / Ctrl+l 重置 / Ctrl+p 置顶（对应皮肤「下移」「降权」键）
-    - lua_processor@*auto_commit                  # 自动上屏（键道顶功模式）：唯一候选在下一键时自动上屏
+    - lua_processor@*auto_commit                  # 自动上屏：唯一候选 + 高置信首位（下一键顶功提交）
     - lua_processor@*punct_commit                  # 标点顶字：按标点键时先提交高亮候选再上屏标点（连续成句）
     - lua_processor@*select_character           # 以词定字：皮肤「首」键(\=backslash)取首字 / 「尾」键(;=semicolon)取末字
     - lua_processor@*demote                     # 手动降权：对当前高亮候选降频（皮肤「降权」键点击发送 Control+Delete）
@@ -168,9 +171,13 @@ select_character:
   first_key: "backslash"
   last_key: "semicolon"
 
-# 顶功自动上屏（借鉴键道）：输入中唯一候选自动上屏（已启用）
+# 顶功自动上屏（借鉴键道 + 对标讯飞 p_autoSelectAllIfNeed）：
+# - 候选唯一时自动上屏（键道顶功）；
+# - 候选不唯一但首位置信度 >= high_conf_threshold 时也自动上屏首位（高置信首位，默认开）。
 auto_commit:
   enable: true
+  high_conf: true            # 高置信首位自动上屏总开关
+  high_conf_threshold: 0.6  # 首位置信度阈值（0~1，越大越保守，误上屏越少）
 
 # 连打键上屏联想词（移植自万象 enable_predict_space 机制；连打键默认 Tab，皮肤第3行表情键发送）
 predict_space:
