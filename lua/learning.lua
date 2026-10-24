@@ -27,6 +27,12 @@ local MIN_FREQ = 8          -- 衰减下限：上屏频次达到该值的词，�
 local MAX_UF = 10           -- 用户词频上限：单条用户词累计频次封顶，防止霸榜（极端保护）
 local last_decay_time = 0
 
+-- 降权词集合（demote.user.tsv）：被手动降权的词不再被学习（对标讯飞 UserWordDelManager，
+-- 防止「删了又学」）。带 TTL 缓存，取消降权后最多 DEMOTE_TTL 秒内重新生效。
+local demoted = {}
+local demoted_loaded_at = 0
+local DEMOTE_TTL = 30
+
 -- 偏旁部首不参与学习：必须完整码输入才出现在候选区，不能通过学习调频。
 local NON_LEARNING_RADICALS = {}
 for ch in ("氵亻艹扌辶讠纟饣忄阝宀疒礻衤钅彳犭夂攵冖冂勹匚廴彡卩厶巛灬爫户戈攴疋癶缶聿艮豸"):gmatch("[\1-\127\194-\244][\128-\191]*") do
@@ -41,6 +47,25 @@ local function user_dir()
     if d and d ~= '' then return d end
   end
   return '.'
+end
+
+-- 加载降权词表（TTL 缓存；取消降权后最多 DEMOTE_TTL 秒内重新生效）
+local function ensure_demoted()
+  local now = os.time()
+  if demoted_loaded_at > 0 and now - demoted_loaded_at < DEMOTE_TTL then return end
+  demoted_loaded_at = now
+  demoted = {}
+  local p = user_dir() .. '/demote.user.tsv'
+  local f = io.open(p, 'r')
+  if f then
+    for line in f:lines() do
+      local w = line:match('^([^\t]+)\t%d+$') or line:match('^([^\t]+)$')
+      if w and w ~= '' then
+        demoted[w] = true
+      end
+    end
+    f:close()
+  end
 end
 
 local function utf8_chars(s)
@@ -221,6 +246,9 @@ end
 function M.add(w, env)
   load(env)
   if not chinese_only(w) then return end
+  ensure_demoted()
+  -- 降权词永久黑名单：被手动降权的词不再被学习（防止「删了又学」）
+  if demoted[w] then return end
   local chars = utf8_chars(w)
   -- 偏旁部首不参与学习，不累计、不调频。
   if #chars == 1 and NON_LEARNING_RADICALS[w] then return end
@@ -330,6 +358,9 @@ end
 function M.learn_word(w, env)
   load(env)
   if not chinese_only(w) then return end
+  ensure_demoted()
+  -- 降权词永久黑名单：被手动降权的词不再被学习（防止「删了又学」）
+  if demoted[w] then return end
   local chars = utf8_chars(w)
   -- 偏旁部首不参与学习。
   if #chars == 1 and NON_LEARNING_RADICALS[w] then return end
