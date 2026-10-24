@@ -31,6 +31,7 @@
 --     expire_seconds: 0        # 0=不超时；>0 表示空输入预测在 N 秒后不再显示
 --     inputting_fusion: true   # 输入中：用户历史词前缀融合
 --     mix_kaomoji: true        # 空输入预测末尾追加颜文字
+--     mix_punct: true          # 空输入预测末尾追加常用标点快捷候选（，。？！……）
 --
 -- 依赖：learning / ngram / stroke / words（require 方式与 segment_phrase 一致）
 -- =============================================================================
@@ -44,6 +45,12 @@ local EXPIRE_SECONDS = 0
 local ENABLED = true
 local INPUTTING_FUSION = true
 local MIX_KAOMOJI = true
+local MIX_PUNCT = true
+
+-- 常用标点快捷候选（② 符号快捷栏的 Rime 侧入口；点击直接上屏，供句子连打收尾）
+local PUNCT_LIST = {
+  "，", "。", "？", "！", "……", "、", "：", "；",
+}
 
 -- 常用颜文字（纯文本、无空格歧义；点击直接上屏，不参与学习）
 local KAOMOJI_LIST = {
@@ -69,6 +76,8 @@ local function load_config(env)
   if v ~= nil then INPUTTING_FUSION = v end
   v = cfg:get_bool('predict_next/mix_kaomoji')
   if v ~= nil then MIX_KAOMOJI = v end
+  v = cfg:get_bool('predict_next/mix_punct')
+  if v ~= nil then MIX_PUNCT = v end
 end
 
 -- ---- 依赖加载（任何一步失败都不影响主流程，直接透传） ----
@@ -267,12 +276,22 @@ local function filter(input, env)
     end
   end
 
-  -- 阶段 3（submitted 态混合候选，路线 G）：预测段末尾追加颜文字
-  if inpt == '' and MIX_KAOMOJI and #existing > 0 then
-    for _, k in ipairs(KAOMOJI_LIST) do
-      if not seen[k] then
-        seen[k] = true
-        yield(Candidate('predict_next', s, e, k, ''))
+  -- 阶段 3（submitted 态混合候选，②符号快捷栏 + 路线 G 颜文字）：预测段末尾追加常用标点与颜文字
+  if inpt == '' and #existing > 0 then
+    if MIX_PUNCT then
+      for _, p in ipairs(PUNCT_LIST) do
+        if not seen[p] then
+          seen[p] = true
+          yield(Candidate('predict_next', s, e, p, ''))
+        end
+      end
+    end
+    if MIX_KAOMOJI then
+      for _, k in ipairs(KAOMOJI_LIST) do
+        if not seen[k] then
+          seen[k] = true
+          yield(Candidate('predict_next', s, e, k, ''))
+        end
       end
     end
   end
