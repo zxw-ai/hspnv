@@ -19,7 +19,7 @@ local SAVE_INTERVAL = 8
 
 -- 配置默认值（可由 schema 的 ngram: 段覆盖）
 local ENABLED = true
-local WORD_STEP = 100000
+local WORD_STEP = 200000
 local WORD_CAP = 3
 local CHAR_STEP = 100000
 local CHAR_CAP = 2
