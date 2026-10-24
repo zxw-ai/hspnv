@@ -123,6 +123,21 @@ local CORRECTION_PAIRS = {
   { "2", "5" }, { "5", "2" },  -- 竖 2 ↔ 折 5（最高频混淆）
   { "3", "4" }, { "4", "3" },   -- 撇 3 ↔ 点 4（次高频）
 }
+-- 数字键相邻误触纠错（对标讯飞 add_keycor_in_segment 按键纠错）：
+-- 快速连打时可能误触相邻数字键（横排 1-2-3-4-5 布局），对相邻键做单位置替换容错。
+-- 独立开关 KEY_NEIGHBOR_ON：默认开，可整体关闭；与笔画形似纠错（CORRECTION_PAIRS）叠加。
+local KEY_NEIGHBOR_ON = true
+local KEY_NEIGHBOR_PAIRS = {
+  { "1", "2" }, { "2", "1" },
+  { "2", "3" }, { "3", "2" },
+  { "3", "4" }, { "4", "3" },
+  { "4", "5" }, { "5", "4" },
+}
+if KEY_NEIGHBOR_ON then
+  for _, p in ipairs(KEY_NEIGHBOR_PAIRS) do
+    CORRECTION_PAIRS[#CORRECTION_PAIRS + 1] = p
+  end
+end
 local correction_stroke_on = true
 
 -- 生成 seg 的所有「单位置易混替换」变体码（去重）
