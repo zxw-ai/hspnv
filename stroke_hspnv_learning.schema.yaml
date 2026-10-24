@@ -100,7 +100,7 @@ predictor:
 # 轻量级 n-gram 上下文联想（基于上屏词对学习，提升连续输入时候选精准度）
 ngram:
   enable: true          # 总开关
-  word_weight: 100000    # 词级上下文分步长（与 learning 频次同量级）
+  word_weight: 200000    # 词级上下文分步长（对标讯飞实时用户 bigram：1 次用户搭配 ≈ 2/3 静态表权重，个性化更快体现）
   word_cap: 3            # 词级上下文分上限（相当于最多 3 次用户频次）
   char_weight: 100000    # 字级上下文分步长
   char_cap: 2            # 字级上下文分上限
@@ -112,6 +112,7 @@ predict_next:
   inputting_fusion: true   # 输入中：用户历史词前缀融合（打下一字时提前命中）
   mix_kaomoji: true        # 空输入预测末尾追加颜文字（路线 G 混合候选）
   mix_punct: true          # 空输入预测末尾追加常用标点快捷候选（，。？！……）
+  mix_quick: true          # 空输入预测末尾追加常用语快捷候选（好的/收到/谢谢…，对标讯飞常用语面板）
 
 # 标点顶字（路线 C）：按标点键先提交高亮候选，再上屏标点
 punct_commit:
