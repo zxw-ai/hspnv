@@ -111,6 +111,7 @@ predict_next:
   expire_seconds: 0        # 0=空输入预测不超时；>0 表示 commit 后 N 秒不再显示预测（候选区留白）
   inputting_fusion: true   # 输入中：用户历史词前缀融合（打下一字时提前命中）
   mix_kaomoji: true        # 空输入预测末尾追加颜文字（路线 G 混合候选）
+  mix_punct: true          # 空输入预测末尾追加常用标点快捷候选（，。？！……）
 
 # 标点顶字（路线 C）：按标点键先提交高亮候选，再上屏标点
 punct_commit:
