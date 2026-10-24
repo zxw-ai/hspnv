@@ -8,6 +8,8 @@ hotword_update.py — hspnv 笔画方案热词自动更新工具（路线 F）
 
 用法：
   python3 hotword_update.py hotwords.txt [--weight 1001] [--expire-days 90] [--dry-run]
+  python3 hotword_update.py --backup --user-dir <元书用户目录>   # 仅备份用户词库
+  python3 hotword_update.py hotwords.txt --blacklist my_blacklist.txt
 
 热词文件格式（每行一个词，可选制表符权重）：
   显眼包
@@ -18,9 +20,11 @@ hotword_update.py — hspnv 笔画方案热词自动更新工具（路线 F）
   1. 从 stroke_hspnv.dict.yaml 加载单字码表，逐字拼接生成整词笔画码；
   2. 跳过含英文/数字/生僻字（码表查不到）的词；
   3. 已存在于 words.lua / dict.yaml / 日志的词自动跳过；
-  4. 新词写入 words.lua（权重 1001 或自定义）并追加到 dict.yaml；
-  5. 记录 tools/hotword_log.tsv（词、码、日期、权重）；
-  6. --expire-days N：超过 N 天未更新的词自动从词库移除（过期降权）。
+  4. 【黑名单】tools/blacklist.txt 中的词跳过（对标讯飞热词黑名单 notifyBlackHotWord）；
+  5. 新词写入 words.lua（权重 1001 或自定义）并追加到 dict.yaml；
+  6. 记录 tools/hotword_log.tsv（词、码、日期、权重）；
+  7. --expire-days N：超过 N 天未更新的词自动从词库移除（过期降权）；
+  8. --backup：把用户目录的学习/ngram/降权数据备份到 tools/backup/。
 
 注意：运行后需重新部署方案（元书）才会生效。
 """
@@ -37,7 +41,15 @@ WORDS_LUA = os.path.join(SCHEMA_DIR, "lua", "words.lua")
 DICT_YAML = os.path.join(SCHEMA_DIR, "stroke_hspnv.dict.yaml")
 LOG_TSV = os.path.join(HERE, "hotword_log.tsv")
 BACKUP_DIR = os.path.join(HERE, "backup")
+BLACKLIST_PATH = os.path.join(HERE, "blacklist.txt")
 DEFAULT_WEIGHT = 1001
+
+# 用户目录下的个人数据文件（对标讯飞云备份：learning/ngram/demote）
+USER_DATA_FILES = [
+    "bg5-learning.user.tsv",
+    "bg5-ngram.user.tsv",
+    "demote.user.tsv",
+]
 
 # ---------- 工具 ----------
 def utf8_chars(s):
@@ -46,6 +58,35 @@ def utf8_chars(s):
 
 def is_chinese_char(ch):
     return len(ch.encode("utf-8")) == 3 and '\u4e00' <= ch <= '\u9fff'
+
+def load_blacklist(path):
+    """加载黑名单（每行一词，# 开头为注释）。不存在则返回空集合。"""
+    words = set()
+    if not path or not os.path.exists(path):
+        return words
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            w = line.strip()
+            if w and not w.startswith("#"):
+                words.add(w)
+    return words
+
+def backup_user_data(user_dir):
+    """备份用户目录下的个人数据文件到 tools/backup/（带时间戳）。返回备份文件数。"""
+    if not user_dir or not os.path.isdir(user_dir):
+        print(f"[错误] 用户目录不存在: {user_dir}")
+        return 0
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    count = 0
+    for name in USER_DATA_FILES:
+        src = os.path.join(user_dir, name)
+        if os.path.exists(src):
+            dst = os.path.join(BACKUP_DIR, name + "." + stamp)
+            shutil.copy2(src, dst)
+            print(f"  [备份] {name} -> {dst}")
+            count += 1
+    return count
 
 def load_char_codes():
     """从 dict.yaml 加载单字码表：字 -> 笔画码（仅取词长为 1 的行）。"""
@@ -223,7 +264,17 @@ def main():
     parser.add_argument("--weight", type=int, default=DEFAULT_WEIGHT, help="新词权重")
     parser.add_argument("--expire-days", type=int, default=0, help="超过 N 天的热词自动移除（0=不移除）")
     parser.add_argument("--dry-run", action="store_true", help="只预览不写入")
+    parser.add_argument("--blacklist", default=BLACKLIST_PATH, help="黑名单文件（默认 tools/blacklist.txt）")
+    parser.add_argument("--backup", action="store_true", help="备份用户词库数据到 tools/backup/")
+    parser.add_argument("--user-dir", help="元书用户数据目录（用于 --backup）")
     args = parser.parse_args()
+
+    # 用户词库备份（对标讯飞云备份）
+    if args.backup:
+        n = backup_user_data(args.user_dir)
+        print(f"[备份] 完成，共 {n} 个文件。备份目录：{BACKUP_DIR}")
+        if not args.hotwords:
+            return
 
     log = load_log()
 
@@ -247,6 +298,7 @@ def main():
     codes = load_char_codes()
     words_lua_set = load_words_lua_set()
     dict_set = load_dict_set()
+    blacklist = load_blacklist(args.blacklist)
     today = datetime.date.today().isoformat()
 
     new_items = []
@@ -260,6 +312,9 @@ def main():
             parts = raw.split("\t")
             w = parts[0]
             weight = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else args.weight
+            if w in blacklist:
+                skipped.append((w, "黑名单"))
+                continue
             if w in log:
                 skipped.append((w, "已在日志中"))
                 continue
