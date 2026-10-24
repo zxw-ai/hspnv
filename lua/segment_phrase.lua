@@ -61,6 +61,17 @@ local WEIGHTS = {
 }
 local WORD_UF_STEP = WEIGHTS.uf_step
 local CHAR_UF_STEP = WEIGHTS.char_uf_step
+-- =============================================================================
+-- 候选惩罚表（对标讯飞 PenaltyMap：配置化「减分」项，调优只需改本表）
+--   recent_repeat_factor : 近期重复词的削弱倍率（循环抑制，<1 为减权）
+--   overlong_len         : 超过该字数的联想候选视为超长
+--   overlong             : 超长词减分（仅作用于联想候选排序）
+-- =============================================================================
+local PENALTIES = {
+  recent_repeat_factor = 0.5,
+  overlong_len = 4,
+  overlong = 2000,
+}
 -- 分词联想上限：预编辑区超过 N 个分词符时不再联想更长词（防爆上限）
 local MAX_WORD_LEN = 8
 
@@ -1533,17 +1544,27 @@ local function build_predict_continuations(env)
   end
   for s in pairs(found) do
     if recent_set[s] and not strong_set[s] then
-      found[s].sf = math.floor((found[s].sf or 0) / 2)
+      found[s].sf = math.floor((found[s].sf or 0) * PENALTIES.recent_repeat_factor)
       -- 同时削弱用户频次：避免「上屏过的词因刚被调频而永远第一」导致连打卡死
-      found[s].uf = math.floor((found[s].uf or 0) / 2)
+      found[s].uf = math.floor((found[s].uf or 0) * PENALTIES.recent_repeat_factor)
     end
     order[#order + 1] = s
   end
   -- 个性化联想提权：用户上屏频次 uf 以大步长参与排序（1 次上屏 ≈ 1 次 ngram 上下文命中）
   local UF_STEP = WORD_UF_STEP
+  -- 超长词惩罚（对标 PenaltyMap）：超过 overlong_len 字且非用户学习词的联想候选减分
+  local function penalty_of(w)
+    if #w > PENALTIES.overlong_len * 3 then  -- UTF-8 字节数 = 字数 * 3
+      if not (learning.is_learned and learning.is_learned(w, env)) then
+        return PENALTIES.overlong
+      end
+    end
+    return 0
+  end
   table.sort(order, function(a, b)
     local item_a, item_b = found[a], found[b]
-    local au, bu = item_a.uf * UF_STEP + (item_a.cf or 0), item_b.uf * UF_STEP + (item_b.cf or 0)
+    local au = item_a.uf * UF_STEP + (item_a.cf or 0) - penalty_of(a)
+    local bu = item_b.uf * UF_STEP + (item_b.cf or 0) - penalty_of(b)
     if au ~= bu then return au > bu end
     if item_a.sf ~= item_b.sf then return item_a.sf > item_b.sf end
     return a < b
