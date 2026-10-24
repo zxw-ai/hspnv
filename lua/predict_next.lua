@@ -1,26 +1,22 @@
--- predict_next.lua v2: 上屏自动预测增强（候选输出状态机 + 混合候选）
+-- predict_next.lua v3: 上屏自动预测增强（候选输出状态机 + 混合候选）
 -- =============================================================================
 -- 在既有「上屏后联想」（segment_phrase 情况0：空输入时输出静态模型预测）基础上，
 -- 本过滤器实现一个轻量「候选输出状态机」（借鉴讯飞 CandidateManager 状态模式）：
 --
 --   standby   （待机）：无输入且无最近上屏 → 不注入任何内容，透传现有预测
---   submitted （已提交）：上屏后 expire_seconds 秒内 → 用户 bigram 直出 + 颜文字混合
+--   submitted （已提交）：上屏后 expire_seconds 秒内 → 用户 bigram 直出 + 混合候选
 --   inputting （输入中）：有输入 → 仅做用户历史词的前缀融合（提前命中）
 --
--- 三个增量能力：
+-- 增量能力：
 --   1. 用户 bigram 直出（submitted 态）：
 --      空输入（刚上屏）时，把 ngram 用户历史中 last->X 的后接词直接排到预测最前。
 --      即使 X 不在静态联想表（next_words_big/phrase_assoc）里，也能被预测。
---
---   2. 输入中融合（inputting 态）：
---      用户打下一个字时，用户历史中能匹配当前笔画前缀的后接词提前。
---      例如历史学过 "上屏->补"，打 "补" 的前缀码 45 时，"补" 直接出现在候选最前。
---
---   3. 混合候选（submitted 态，路线 G）：
---      预测段末尾追加常用颜文字/表情（可开关），让候选区在句子停顿处更生动。
---
---   4. 可选超时隐藏（submitted -> standby）：
---      空输入预测在 commit 后 N 秒不再显示（候选区留白），避免预测词长期占位。
+--   2. 输入中融合（inputting 态）：用户打下一个字时，用户历史中能匹配当前笔画前缀的后接词提前。
+--   3. 混合候选（submitted 态）：预测段末尾追加：
+--      - 常用标点快捷候选（② 符号快捷栏，，。？！……）
+--      - 常用语快捷候选（对标讯飞常用语面板，如 好的/收到/谢谢/没问题）
+--      - 常用颜文字（路线 G，让停顿处更生动）
+--   4. 可选超时隐藏（submitted -> standby）：空输入预测在 commit 后 N 秒不再显示。
 --
 -- 挂载（stroke_hspnv_learning.schema.yaml 的 filters 链【末尾】追加一行）：
 --   - lua_filter@*predict_next
@@ -32,6 +28,7 @@
 --     inputting_fusion: true   # 输入中：用户历史词前缀融合
 --     mix_kaomoji: true        # 空输入预测末尾追加颜文字
 --     mix_punct: true          # 空输入预测末尾追加常用标点快捷候选（，。？！……）
+--     mix_quick: true          # 空输入预测末尾追加常用语快捷候选（好的/收到/谢谢…）
 --
 -- 依赖：learning / ngram / stroke / words（require 方式与 segment_phrase 一致）
 -- =============================================================================
@@ -46,10 +43,17 @@ local ENABLED = true
 local INPUTTING_FUSION = true
 local MIX_KAOMOJI = true
 local MIX_PUNCT = true
+local MIX_QUICK = true
 
 -- 常用标点快捷候选（② 符号快捷栏的 Rime 侧入口；点击直接上屏，供句子连打收尾）
 local PUNCT_LIST = {
   "，", "。", "？", "！", "……", "、", "：", "；",
+}
+
+-- 常用语快捷候选（对标讯飞「常用语面板」：上屏停顿处直接点选，少打整词笔画）
+-- 全部为高频口语短词，纯中文可输；点击直接上屏，不参与学习。
+local QUICK_PHRASES = {
+  "好的", "收到", "谢谢", "没问题", "哈哈哈", "嗯嗯", "知道了", "可以",
 }
 
 -- 常用颜文字（纯文本、无空格歧义；点击直接上屏，不参与学习）
@@ -78,6 +82,8 @@ local function load_config(env)
   if v ~= nil then MIX_KAOMOJI = v end
   v = cfg:get_bool('predict_next/mix_punct')
   if v ~= nil then MIX_PUNCT = v end
+  v = cfg:get_bool('predict_next/mix_quick')
+  if v ~= nil then MIX_QUICK = v end
 end
 
 -- ---- 依赖加载（任何一步失败都不影响主流程，直接透传） ----
@@ -276,13 +282,22 @@ local function filter(input, env)
     end
   end
 
-  -- 阶段 3（submitted 态混合候选，②符号快捷栏 + 路线 G 颜文字）：预测段末尾追加常用标点与颜文字
+  -- 阶段 3（submitted 态混合候选）：预测段末尾追加 标点 → 常用语 → 颜文字
+  -- 对标讯飞「常用语面板」：标点负责句子收尾，常用语负责高频回复，颜文字负责生动。
   if inpt == '' and #existing > 0 then
     if MIX_PUNCT then
       for _, p in ipairs(PUNCT_LIST) do
         if not seen[p] then
           seen[p] = true
           yield(Candidate('predict_next', s, e, p, ''))
+        end
+      end
+    end
+    if MIX_QUICK then
+      for _, q in ipairs(QUICK_PHRASES) do
+        if not seen[q] then
+          seen[q] = true
+          yield(Candidate('predict_next', s, e, q, ''))
         end
       end
     end
