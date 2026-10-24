@@ -92,6 +92,11 @@ local PRIORITY_COMPONENTS = {}
 for ch in ("一丨丿丶乙氵亻艹扌辶讠纟饣忄阝宀疒礻衤钅彳犭夂攵冖冂勹匚廴彡卩厶巛灬爫户戈攴疋癶缶聿艮豸"):gmatch("[\1-\127\194-\244][\128-\191]*") do
   PRIORITY_COMPONENTS[ch] = true
 end
+-- 部件提前提示（③，对标讯飞 SPZ 字根提前展开的轻量版）：
+-- 输入常用偏旁/部首的前 N 笔时，提前把该部件作为候选显示（低 rank，不抢精确位）。
+-- rank 设计：精确(0) < 提前部件(1200) < 笔画纠错(1500) < 普通前缀桶(2000+)
+local COMPONENT_EARLY_RANK = 1200
+local COMPONENT_EARLY_MIN = 2   -- 至少输入 2 笔才提前提示（单笔不提示，避免干扰）
 -- 模糊笔画：开启后「折(5) ≈ 竖(2)」容错（常见笔顺混淆）。
 -- 用于完整码精确匹配与词匹配（prefix_match）；前缀 Trie 桶保持严格匹配以控制候选噪音。
 local fuzzy_stroke_on = false
@@ -606,11 +611,15 @@ local function chars_for(seg, env)
     end
   end
 
-  -- 只有完整笔顺输入时才注入偏旁/部首；前缀阶段不抢普通高频字位置。
+  -- 部件注入：完整码精确显示（component 顶格）；前 COMPONENT_EARLY_MIN 笔起提前提示（低 rank，不抢精确位）。
   for ch in pairs(PRIORITY_COMPONENTS) do
     local code = stroke[ch]
     if complete_component(ch, code, seg) then
       add_unique(out, seen, ch, true, 900000, true)
+    elseif code and COMPONENT_EARLY_MIN > 0 and not seg:find("?", 1, true)
+        and #seg >= COMPONENT_EARLY_MIN and #code > #seg and code:sub(1, #seg) == seg then
+      -- 提前提示：当作普通候选（component=false，避免因部件优先而跳顶），rank 介于精确与纠错之间
+      add_unique(out, seen, ch, false, COMPONENT_EARLY_RANK, false)
     end
   end
 
