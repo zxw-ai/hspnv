@@ -1647,6 +1647,19 @@ local function translator(input, seg, env)
     end
   end
 
+  -- 顶部 preedit 显示笔画符号（如 323'53 -> 丿丨丿'乛丿），不显示阿拉伯数字
+  -- 必须放在任何提前 return 分支（降权/下移等功能键）之前，
+  -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
+  if input and input ~= '' then
+    local ctx = env.engine and env.engine.context
+    if ctx and ctx.composition and not ctx.composition:empty() then
+      local segobj = ctx.composition:back()
+      if segobj then
+        segobj.preedit = to_stroke_symbol(input)
+      end
+    end
+  end
+
   -- 手机皮肤功能键兜底（元书 character 可能以文本输入到达，处理器收不到按键事件）
   -- ] = 降权：对当前高亮候选降频并移除
   if input:sub(-1, -1) == ']' then
@@ -1672,17 +1685,6 @@ local function translator(input, seg, env)
     end
     if ctx then ctx:delete_input(1) end
     return
-  end
-
-  -- 顶部 preedit 显示笔画符号（如 323'53 -> 丿丨丿'乛丿），不显示阿拉伯数字
-  if input and input ~= '' then
-    local ctx = env.engine and env.engine.context
-    if ctx and ctx.composition and not ctx.composition:empty() then
-      local segobj = ctx.composition:back()
-      if segobj then
-        segobj.preedit = to_stroke_symbol(input)
-      end
-    end
   end
 
   -- 情况 0: 空输入状态（字/词刚刚上屏，等待用户打下一个字或点击联想）
