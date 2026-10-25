@@ -505,7 +505,8 @@ end
 
 -- 强制把 composition 所有段的 preedit 都设为笔画符号（防止「输入段 + 预测段」多段并存时，
 -- 只设置了最后一段导致输入段回退显示原始数字）。
--- 兼容新旧 librime-lua：优先 get_segments() 遍历，失败则退化为 back()。
+-- 正确 API：Composition:toSegmentation():get_segments() 返回真实段指针数组（vector<Segment*>），
+-- 修改段.preedit 会写回 C++ 对象；兼容旧版 librime-lua 退化为 back()。
 local function force_preedit(env, inpt)
   if not env or not inpt or inpt == '' then return end
   local ctx = env.engine and env.engine.context
@@ -513,16 +514,28 @@ local function force_preedit(env, inpt)
   local comp = ctx.composition
   if not comp or comp:empty() then return end
   local sym = to_stroke_symbol(inpt)
-  -- 新 API：遍历全部段
-  local ok, segs = pcall(function() return comp:get_segments() end)
-  if ok and type(segs) == 'table' then
-    for _, s in ipairs(segs) do
+  -- 1. 新版 API：Composition -> Segmentation -> 全部真实段指针
+  local ok, segm = pcall(function() return comp:toSegmentation() end)
+  if ok and segm then
+    local ok2, segs = pcall(function() return segm:get_segments() end)
+    if ok2 and type(segs) == 'table' then
+      for _, s in ipairs(segs) do
+        if type(s) == 'table' then
+          pcall(function() s.preedit = sym end)
+        end
+      end
+    end
+  end
+  -- 2. 直接尝试 Composition:get_segments（部分实现可能暴露）
+  local ok3, segs3 = pcall(function() return comp:get_segments() end)
+  if ok3 and type(segs3) == 'table' then
+    for _, s in ipairs(segs3) do
       if type(s) == 'table' then
         pcall(function() s.preedit = sym end)
       end
     end
   end
-  -- 兜底：设置最后一段（旧 API 或 get_segments 返回副本时仍保证尾部生效）
+  -- 3. 兜底：设置最后一段（旧 API 或上述失败时仍保证尾部生效）
   local segobj = comp:back()
   if segobj then
     pcall(function() segobj.preedit = sym end)
