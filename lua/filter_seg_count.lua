@@ -33,6 +33,31 @@ local function to_stroke_symbol(s)
   return s:gsub("1", "一"):gsub("2", "丨"):gsub("3", "丿"):gsub("4", "丶"):gsub("5", "乛"):gsub("[^一丨丿丶乛']", "？")
 end
 
+-- 强制把 composition 所有段的 preedit 都设为笔画符号（防止「输入段 + 预测段」多段并存时，
+-- 只设置了最后一段导致输入段回退显示原始数字）。兼容新旧 librime-lua API。
+local function force_preedit(env, inpt)
+  if not env or not inpt or inpt == '' then return end
+  local ctx = env.engine and env.engine.context
+  if not ctx then return end
+  local comp = ctx.composition
+  if not comp or comp:empty() then return end
+  local sym = to_stroke_symbol(inpt)
+  -- 新 API：遍历全部段
+  local ok, segs = pcall(function() return comp:get_segments() end)
+  if ok and type(segs) == 'table' then
+    for _, s in ipairs(segs) do
+      if type(s) == 'table' then
+        pcall(function() s.preedit = sym end)
+      end
+    end
+  end
+  -- 兜底：设置最后一段（旧 API 或 get_segments 返回副本时仍保证尾部生效）
+  local segobj = comp:back()
+  if segobj then
+    pcall(function() segobj.preedit = sym end)
+  end
+end
+
 -- 强制清理候选：comment 一律空字符串，preedit 一律为笔画符号。
 -- 用 pcall 包裹 Candidate 构造：即使真机 librime-lua API 有差异导致构造失败，
 -- 也绝不让清理过程吞掉候选（候选丢失会导致 Hamster 回退显示原始数字），此时放行原候选。
@@ -86,15 +111,7 @@ local function filter(input, env)
   end
 
   -- 强制顶部 preedit 显示笔画符号（323'53 -> 丿丨丿'乛丿），不显示阿拉伯数字
-  if inpt ~= "" then
-    local comp = ctx.composition
-    if comp and not comp:empty() then
-      local segobj = comp:back()
-      if segobj then
-        segobj.preedit = to_stroke_symbol(inpt)
-      end
-    end
-  end
+  force_preedit(env, inpt)
 
   -- 核心保障 1: 如果当前输入为空（字词刚上屏，进入连续联想阶段），无条件放行所有联想候选！
   if inpt == "" then
