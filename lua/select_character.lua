@@ -104,15 +104,17 @@ function M.func(key_event, env)
     return true
   end
 
-  -- 总是消费这两个键（避免漏给后续处理器造成误提交/清空候选区）
+  -- 有候选词时才消费这两个键（以词定字取首/尾字）；
+  -- 无候选时放行（如符号键盘输入分号/反斜杠，避免被本处理器吞掉导致无输出）。
   if is_first_key() then
     if has_menu and is_real_candidate() then
       local text = pick_character(ctx, first_character)
       if text then
         commit_text(env, ctx, text)
       end
+      return 1
     end
-    return 1
+    return 2
   end
 
   if is_last_key() then
@@ -121,8 +123,9 @@ function M.func(key_event, env)
       if text then
         commit_text(env, ctx, text)
       end
+      return 1
     end
-    return 1
+    return 2
   end
 
   return 2
