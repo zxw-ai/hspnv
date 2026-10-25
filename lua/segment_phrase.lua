@@ -1694,6 +1694,13 @@ local function translator(input, seg, env)
   -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
   force_preedit(env, input)
 
+  -- 纯问号输入：符号键盘的问号（元书以半角 ? 键码发送）按标点输出全角 ？，
+  -- 不作为通配符；笔画码中的 ?（如 31?）仍走通配逻辑。
+  if input and input:match("^[?]+$") then
+    yield(make_candidate('single', seg.start, seg._end, '？', input))
+    return
+  end
+
   -- 手机皮肤功能键兜底（元书 character 可能以文本输入到达，处理器收不到按键事件）
   -- ] = 降权：对当前高亮候选降频并移除
   if input:sub(-1, -1) == ']' then
