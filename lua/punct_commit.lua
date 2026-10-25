@@ -54,16 +54,20 @@ local function is_punct_key(key_event)
 end
 
 -- 判断是否为问号键（?）：
--- 元书可能以 Shift+/（keycode 0x2f + shift）、repr 含 ?、或 character='?' 到达。
+-- 元书可能以 Shift+/（keycode 0x2f + shift）、ASCII 0x3f、repr 含 ?、或 character='?' 到达。
 local function is_question_key(key_event)
-  local code = keycode_of(key_event)
+  if type(key_event) ~= 'table' then return false end
+  local code = nil
+  pcall(function() code = key_event.keycode end)
   local shift = false
   pcall(function() shift = key_event.shift end)
   if code == 0x2f and shift then return true end
+  if code == 0x3f then return true end  -- ASCII '?'
   local repr = ''
   pcall(function() repr = key_event:repr() or '' end)
-  if repr and (repr:find('?') or repr:find('Question') or repr:find('slash')) then
-    if repr:find('?') or repr:find('Question') then return true end
+  if repr and repr ~= '' then
+    local r = repr:lower()
+    if r == '?' or r:find('question') or r:find('shift+slash') then return true end
   end
   local ch = ''
   pcall(function()
