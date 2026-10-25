@@ -503,6 +503,32 @@ local function to_stroke_symbol(s)
   return s:gsub("1", "一"):gsub("2", "丨"):gsub("3", "丿"):gsub("4", "丶"):gsub("5", "乛"):gsub("[^一丨丿丶乛']", "？")
 end
 
+-- 强制把 composition 所有段的 preedit 都设为笔画符号（防止「输入段 + 预测段」多段并存时，
+-- 只设置了最后一段导致输入段回退显示原始数字）。
+-- 兼容新旧 librime-lua：优先 get_segments() 遍历，失败则退化为 back()。
+local function force_preedit(env, inpt)
+  if not env or not inpt or inpt == '' then return end
+  local ctx = env.engine and env.engine.context
+  if not ctx then return end
+  local comp = ctx.composition
+  if not comp or comp:empty() then return end
+  local sym = to_stroke_symbol(inpt)
+  -- 新 API：遍历全部段
+  local ok, segs = pcall(function() return comp:get_segments() end)
+  if ok and type(segs) == 'table' then
+    for _, s in ipairs(segs) do
+      if type(s) == 'table' then
+        pcall(function() s.preedit = sym end)
+      end
+    end
+  end
+  -- 兜底：设置最后一段（旧 API 或 get_segments 返回副本时仍保证尾部生效）
+  local segobj = comp:back()
+  if segobj then
+    pcall(function() segobj.preedit = sym end)
+  end
+end
+
 local function make_candidate(type, start, _end, text, raw_input)
   local c = Candidate(type, start, _end, text, '')
   local preedit = raw_input or ''
@@ -1650,15 +1676,7 @@ local function translator(input, seg, env)
   -- 顶部 preedit 显示笔画符号（如 323'53 -> 丿丨丿'乛丿），不显示阿拉伯数字
   -- 必须放在任何提前 return 分支（降权/下移等功能键）之前，
   -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
-  if input and input ~= '' then
-    local ctx = env.engine and env.engine.context
-    if ctx and ctx.composition and not ctx.composition:empty() then
-      local segobj = ctx.composition:back()
-      if segobj then
-        segobj.preedit = to_stroke_symbol(input)
-      end
-    end
-  end
+  force_preedit(env, input)
 
   -- 手机皮肤功能键兜底（元书 character 可能以文本输入到达，处理器收不到按键事件）
   -- ] = 降权：对当前高亮候选降频并移除
