@@ -135,10 +135,25 @@ function M.func(key_event, env)
   -- 仅对标点键生效
   if not is_punct_key(key_event) then return 2 end
 
-  -- 输入为空则不顶字（直接让标点正常上屏）
+  -- 判断是否为全角标点（符号键盘以字符方式发送，Rime 无法通过键码路径处理）
+  local punct_ch = ''
+  pcall(function()
+    if key_event.character then punct_ch = key_event.character end
+  end)
+  local is_full_punct = FULL_PUNCT[punct_ch] == true
+
+  -- 输入为空：
+  --  - 全角标点：直接上屏标点（否则 Rime 无法输出）
+  --  - 半角标点：放行给 Rime punctuator 正常上屏
   local input = ''
   pcall(function() input = ctx:get_input() or '' end)
-  if input == '' then return 2 end
+  if input == '' then
+    if is_full_punct then
+      commit_text(env, ctx, punct_ch)
+      return 1
+    end
+    return 2
+  end
 
   -- 取当前段菜单（与 auto_commit 相同方式，已就绪）
   local seg = nil
@@ -154,8 +169,13 @@ function M.func(key_event, env)
   if c1 then
     -- 提交高亮候选（正确文本，非原始输入码）
     pcall(function() ctx:commit() end)
-    -- 返回 2（不消费按键）：commit 后 input 已清空，当前标点键继续被正常处理上屏
   end
+  if is_full_punct then
+    -- 全角标点：直接上屏标点，与候选一起完成「标点顶字」
+    commit_text(env, ctx, punct_ch)
+    return 1
+  end
+  -- 半角标点：返回 2（不消费按键），commit 后 input 已清空，标点键继续被 Rime 处理上屏
   return 2
 end
 
