@@ -33,26 +33,34 @@ local function to_stroke_symbol(s)
   return s:gsub("1", "一"):gsub("2", "丨"):gsub("3", "丿"):gsub("4", "丶"):gsub("5", "乛"):gsub("[^一丨丿丶乛']", "？")
 end
 
--- 强制把 composition 所有段的 preedit 都设为笔画符号（防止「输入段 + 预测段」多段并存时，
--- 只设置了最后一段导致输入段回退显示原始数字）。
+-- 强制把 composition 各输入段的 preedit 都设为对应子串的笔画符号
+-- （防止「输入段 + 预测段」多段并存时，只设置了最后一段导致输入段回退显示原始数字）。
 -- 正确 API：Composition:toSegmentation():get_segments() 返回真实段指针数组（vector<Segment*>），
 -- 修改段.preedit 会写回 C++ 对象；兼容旧版 librime-lua 退化为 back()。
+-- 只处理「有实际输入范围」的段（en > st），预测段/占位段（st==en）不设置，避免干扰拼接。
 local function force_preedit(env, inpt)
   if not env or not inpt or inpt == '' then return end
   local ctx = env.engine and env.engine.context
   if not ctx then return end
   local comp = ctx.composition
   if not comp or comp:empty() then return end
-  local sym = to_stroke_symbol(inpt)
+  local function apply(seg)
+    if type(seg) ~= 'table' then return end
+    local st, en = seg.start, seg._end
+    if st == nil then st = seg._start end
+    if st == nil or en == nil then return end
+    if en > st and st >= 0 and en <= #inpt then
+      local sub = inpt:sub(st + 1, en)
+      pcall(function() seg.preedit = to_stroke_symbol(sub) end)
+    end
+  end
   -- 1. 新版 API：Composition -> Segmentation -> 全部真实段指针
   local ok, segm = pcall(function() return comp:toSegmentation() end)
   if ok and segm then
     local ok2, segs = pcall(function() return segm:get_segments() end)
     if ok2 and type(segs) == 'table' then
       for _, s in ipairs(segs) do
-        if type(s) == 'table' then
-          pcall(function() s.preedit = sym end)
-        end
+        apply(s)
       end
     end
   end
@@ -60,16 +68,11 @@ local function force_preedit(env, inpt)
   local ok3, segs3 = pcall(function() return comp:get_segments() end)
   if ok3 and type(segs3) == 'table' then
     for _, s in ipairs(segs3) do
-      if type(s) == 'table' then
-        pcall(function() s.preedit = sym end)
-      end
+      apply(s)
     end
   end
-  -- 3. 兜底：设置最后一段（旧 API 或上述失败时仍保证尾部生效）
-  local segobj = comp:back()
-  if segobj then
-    pcall(function() segobj.preedit = sym end)
-  end
+  -- 3. 兜底：设置最后一段（旧 API 或上述失败时仍保证输入段生效）
+  apply(comp:back())
 end
 
 -- 强制清理候选：comment 一律空字符串，preedit 一律为笔画符号。
