@@ -34,6 +34,12 @@ local PUNCT_SHIFT = {
   [0x2f] = true,  -- ?
   [0x31] = true,  -- !
 }
+-- 全角标点字符（符号键盘/文本方式到达，如「。 」等）
+local FULL_PUNCT = {
+  ['，'] = true, ['。'] = true, ['？'] = true, ['！'] = true,
+  ['：'] = true, ['；'] = true, ['、'] = true, ['～'] = true,
+  ['……'] = true, ['—'] = true,
+}
 
 local function keycode_of(key_event)
   if type(key_event) == 'number' then return key_event end
@@ -44,13 +50,22 @@ end
 
 local function is_punct_key(key_event)
   local code = keycode_of(key_event)
-  if not code then return false end
-  local shift = false
-  pcall(function() shift = key_event.shift end)
-  if shift then
-    return PUNCT_SHIFT[code] == true
+  if code then
+    local shift = false
+    pcall(function() shift = key_event.shift end)
+    if shift then
+      if PUNCT_SHIFT[code] then return true end
+    else
+      if PUNCT_BASE[code] then return true end
+    end
   end
-  return PUNCT_BASE[code] == true
+  -- 全角标点字符（元书符号键盘可能以字符方式发送）
+  local ch = ''
+  pcall(function()
+    if key_event.character then ch = key_event.character end
+  end)
+  if FULL_PUNCT[ch] then return true end
+  return false
 end
 
 -- 判断是否为问号键（?）：
