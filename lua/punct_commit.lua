@@ -53,6 +53,41 @@ local function is_punct_key(key_event)
   return PUNCT_BASE[code] == true
 end
 
+-- 判断是否为问号键（?）：
+-- 元书可能以 Shift+/（keycode 0x2f + shift）、repr 含 ?、或 character='?' 到达。
+local function is_question_key(key_event)
+  local code = keycode_of(key_event)
+  local shift = false
+  pcall(function() shift = key_event.shift end)
+  if code == 0x2f and shift then return true end
+  local repr = ''
+  pcall(function() repr = key_event:repr() or '' end)
+  if repr and (repr:find('?') or repr:find('Question') or repr:find('slash')) then
+    if repr:find('?') or repr:find('Question') then return true end
+  end
+  local ch = ''
+  pcall(function()
+    if key_event.character then ch = key_event.character
+    elseif key_event.type == 'character' and key_event.value then ch = key_event.value end
+  end)
+  if ch == '?' then return true end
+  return false
+end
+
+-- 提交文本（兼容 engine:commit_text / ctx:commit_text）
+local function commit_text(env, ctx, text)
+  local ok = false
+  pcall(function()
+    if env.engine and env.engine.commit_text then
+      env.engine:commit_text(text)
+      ok = true
+    end
+  end)
+  if not ok then
+    pcall(function() ctx:commit_text(text) end)
+  end
+end
+
 function M.func(key_event, env)
   -- 配置开关
   local config = env.engine and env.engine.schema and env.engine.schema.config
@@ -63,11 +98,23 @@ function M.func(key_event, env)
   end
   if not enabled then return 2 end
 
-  -- 仅对标点键生效
-  if not is_punct_key(key_event) then return 2 end
-
   local ctx = env.engine and env.engine.context
   if not ctx then return 2 end
+
+  -- 问号特殊处理：空输入时按 ? 直接上屏全角 ？，避免符号键盘问号被当作笔画通配符。
+  -- 若当前已有笔画码（如 31），放行 ? 作为通配符。
+  if is_question_key(key_event) then
+    local input = ''
+    pcall(function() input = ctx:get_input() or '' end)
+    if input == '' then
+      commit_text(env, ctx, '？')
+      return 1  -- 已消费按键
+    end
+    return 2
+  end
+
+  -- 仅对标点键生效
+  if not is_punct_key(key_event) then return 2 end
 
   -- 输入为空则不顶字（直接让标点正常上屏）
   local input = ''
