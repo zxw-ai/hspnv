@@ -1,0 +1,32 @@
+# 自定义短语词典的「构建载体」方案
+#
+# 主方案 stroke_hspnv_learning 的 dependencies 里引用了 custom_phrase，
+# 但 Rime 只会为「方案」构建词典与 prism：没有这个文件时，
+# custom_phrase.dict.yaml 不会被编译成 stroke_custom_phrase.prism.bin，
+# lua 侧的 Component.Translator(env.engine, "custom_phrase", "script_translator") 就会拿不到词库，
+# 「自定义短语置顶」静默失效。
+#
+# 注意：本方案不需要出现在 schema_list 里（作为依赖被加载即可）。
+schema:
+  schema_id: custom_phrase
+  name: 自定义短语（内部依赖）
+  version: "1.0"
+  description: 仅为构建 custom_phrase 词典与 stroke_custom_phrase.prism 而存在
+
+engine:
+  translators:
+    - table_translator
+
+speller:
+  alphabet: "12345?'V"
+  delimiter: " '"
+
+menu:
+  page_size: 5
+
+translator:
+  dictionary: custom_phrase
+  prism: stroke_custom_phrase   # 必须与主方案 custom_phrase/prism 一致
+  enable_user_dict: false
+  enable_completion: false
+  enable_encoder: false

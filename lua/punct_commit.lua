@@ -21,24 +21,38 @@
 local M = {}
 
 -- 标点键码（Rime/X11 keycode）
--- 无 Shift：, . / ;
+-- 无 Shift：, . / 以及元书皮肤直接发送的字符键码 ! :
+-- 注：Hamster 皮肤 character:'!' 发送 0x21，character:':' 发送 0x3a（不带 Shift）
+-- 注意：0x3b（; 分号）不在其中——分号键码保留给「末」键（以词定字取末字），
+-- 分号标点输入由顶部符号快捷栏发送全角「；」经 FULL_PUNCT 路径处理。
 local PUNCT_BASE = {
   [0x2c] = true,  -- ,
   [0x2e] = true,  -- .
   [0x2f] = true,  -- /
-  [0x3b] = true,  -- ;
+  [0x21] = true,  -- !
+  [0x3a] = true,  -- :
 }
--- 带 Shift：; -> :   / -> ?   1 -> !
+-- 带 Shift：; -> :   / -> ?
+-- 注意：0x31 是数字 1 键的键码，**不是** '!'（'!' 的 keysym 是 0x21）。
+-- 之前误把 0x31 列在这里，若元书把数字行按键报告成 shift 状态，按 1 会被当成标点键处理。
+-- Shift+1 的 '!' 由 PUNCT_BASE[0x21] 与 character '!' 两条路径覆盖，删掉 0x31 不影响。
 local PUNCT_SHIFT = {
   [0x3b] = true,  -- :
   [0x2f] = true,  -- ?
-  [0x31] = true,  -- !
 }
 -- 全角标点字符（符号键盘/文本方式到达，如「。 」等）
 local FULL_PUNCT = {
   ['，'] = true, ['。'] = true, ['？'] = true, ['！'] = true,
   ['：'] = true, ['；'] = true, ['、'] = true, ['～'] = true,
   ['……'] = true, ['—'] = true,
+}
+-- 半角标点字符 → 对应中文标点（皮肤以 character 方式发送且 keycode 不可用时，
+-- Rime punctuator 无法处理，需由本处理器直接上屏全角标点）
+-- 注意：分号 ; 不在其中——分号键码（0x3b）保留给「末」键（以词定字取末字），
+-- 分号输入由顶部符号快捷栏发送全角「；」经 FULL_PUNCT 路径处理。
+local HALF_PUNCT = {
+  [','] = '，', ['.'] = '。', ['/'] = '、',
+  [':'] = '：', ['?'] = '？', ['!'] = '！',
 }
 
 local function keycode_of(key_event)
@@ -59,12 +73,13 @@ local function is_punct_key(key_event)
       if PUNCT_BASE[code] then return true end
     end
   end
-  -- 全角标点字符（元书符号键盘可能以字符方式发送）
+  -- 全角/半角标点字符（元书符号键盘/皮肤可能以字符方式发送）
   local ch = ''
   pcall(function()
     if key_event.character then ch = key_event.character end
   end)
   if FULL_PUNCT[ch] then return true end
+  if HALF_PUNCT[ch] then return true end
   return false
 end
 
@@ -93,17 +108,30 @@ local function is_question_key(key_event)
   return false
 end
 
--- 提交文本（兼容 engine:commit_text / ctx:commit_text）
+-- 提交文本（兼容 engine:commit_text / ctx:commit_text，多重兜底确保标点能上屏）
 local function commit_text(env, ctx, text)
-  local ok = false
+  local done = false
   pcall(function()
     if env.engine and env.engine.commit_text then
       env.engine:commit_text(text)
-      ok = true
+      done = true
     end
   end)
-  if not ok then
-    pcall(function() ctx:commit_text(text) end)
+  if not done then
+    pcall(function()
+      if ctx and ctx.commit_text then
+        ctx:commit_text(text)
+        done = true
+      end
+    end)
+  end
+  if not done then
+    pcall(function()
+      if env.engine and env.engine.context then
+        env.engine.context:commit_text(text)
+        done = true
+      end
+    end)
   end
 end
 
@@ -143,13 +171,19 @@ function M.func(key_event, env)
   local is_full_punct = FULL_PUNCT[punct_ch] == true
 
   -- 输入为空：
-  --  - 全角标点：直接上屏标点（否则 Rime 无法输出）
-  --  - 半角标点：放行给 Rime punctuator 正常上屏
+  --  - 全角标点：直接上屏标点
+  --  - 半角标点（任何 keycode 状态）：直接上屏对应中文标点，确保标点可靠输出
+  --    （不依赖 punctuator，避免元书 character 事件 keycode 异常时无输出）
   local input = ''
   pcall(function() input = ctx:get_input() or '' end)
   if input == '' then
     if is_full_punct then
       commit_text(env, ctx, punct_ch)
+      return 1
+    end
+    local full = HALF_PUNCT[punct_ch]
+    if full then
+      commit_text(env, ctx, full)
       return 1
     end
     return 2
@@ -167,15 +201,31 @@ function M.func(key_event, env)
     c1 = seg.menu:get_candidate_at(0)
   end)
   if c1 then
-    -- 提交高亮候选（正确文本，非原始输入码）
-    pcall(function() ctx:commit() end)
+    -- 提交高亮候选：优先 ctx:commit()；若异常则清空并用 commit_text 兜底，
+    -- 确保「标点顶字」在任何 Rime 实现下候选都能上屏。
+    local committed = false
+    pcall(function()
+      ctx:commit()
+      committed = true
+    end)
+    if not committed then
+      pcall(function() ctx:clear() end)
+      commit_text(env, ctx, c1.text)
+    end
   end
   if is_full_punct then
     -- 全角标点：直接上屏标点，与候选一起完成「标点顶字」
     commit_text(env, ctx, punct_ch)
     return 1
   end
-  -- 半角标点：返回 2（不消费按键），commit 后 input 已清空，标点键继续被 Rime 处理上屏
+  -- 半角标点：提交候选后直接上屏对应中文标点（不依赖 punctuator，
+  -- 避免元书 character 事件 keycode 异常时标点无法输出）
+  local full = HALF_PUNCT[punct_ch]
+  if full then
+    commit_text(env, ctx, full)
+    return 1
+  end
+  -- 无法映射的标点：返回 2（不消费按键），让 Rime 继续处理
   return 2
 end
 

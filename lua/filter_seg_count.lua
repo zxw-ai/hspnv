@@ -27,68 +27,25 @@ local function get_cand_text(cand)
   return nil
 end
 
--- 笔画符号转换：1-5 → 一丨丿丶乛，' 保留，其余字符 → ？（绝不出现阿拉伯数字）
-local function to_stroke_symbol(s)
-  if not s then return "" end
-  return s:gsub("1", "一"):gsub("2", "丨"):gsub("3", "丿"):gsub("4", "丶"):gsub("5", "乛"):gsub("[^一丨丿丶乛']", "？")
-end
+-- 笔画符号转换与「各段 preedit 设置」已抽到 lua/preedit_util.lua（与 segment_phrase 共用同一实现）
+local preedit_util = require('preedit_util')
+local function to_stroke_symbol(s) return preedit_util.to_stroke_symbol(s) end
+local function force_preedit(env, inpt) preedit_util.set_preedit(env, inpt) end
 
--- 强制把 composition 各输入段的 preedit 都设为对应子串的笔画符号
--- （防止「输入段 + 预测段」多段并存时，只设置了最后一段导致输入段回退显示原始数字）。
--- 正确 API：Composition:toSegmentation():get_segments() 返回真实段指针数组（vector<Segment*>），
--- 修改段.preedit 会写回 C++ 对象；兼容旧版 librime-lua 退化为 back()。
--- 只处理「有实际输入范围」的段（en > st），预测段/占位段（st==en）不设置，避免干扰拼接。
-local function force_preedit(env, inpt)
-  if not env or not inpt or inpt == '' then return end
-  local ctx = env.engine and env.engine.context
-  if not ctx then return end
-  local comp = ctx.composition
-  if not comp or comp:empty() then return end
-  local function apply(seg)
-    if type(seg) ~= 'table' then return end
-    local st, en = seg.start, seg._end
-    if st == nil then st = seg._start end
-    if st == nil or en == nil then return end
-    if en > st and st >= 0 and en <= #inpt then
-      local sub = inpt:sub(st + 1, en)
-      pcall(function() seg.preedit = to_stroke_symbol(sub) end)
-    end
-  end
-  -- 1. 新版 API：Composition -> Segmentation -> 全部真实段指针
-  local ok, segm = pcall(function() return comp:toSegmentation() end)
-  if ok and segm then
-    local ok2, segs = pcall(function() return segm:get_segments() end)
-    if ok2 and type(segs) == 'table' then
-      for _, s in ipairs(segs) do
-        apply(s)
-      end
-    end
-  end
-  -- 2. 直接尝试 Composition:get_segments（部分实现可能暴露）
-  local ok3, segs3 = pcall(function() return comp:get_segments() end)
-  if ok3 and type(segs3) == 'table' then
-    for _, s in ipairs(segs3) do
-      apply(s)
-    end
-  end
-  -- 3. 兜底：设置最后一段（旧 API 或上述失败时仍保证输入段生效）
-  apply(comp:back())
-end
-
--- 强制清理候选：comment 一律空字符串，preedit 一律为笔画符号。
--- 用 pcall 包裹 Candidate 构造：即使真机 librime-lua API 有差异导致构造失败，
--- 也绝不让清理过程吞掉候选（候选丢失会导致 Hamster 回退显示原始数字），此时放行原候选。
 local function clean_cand(cand, raw)
   local text = get_cand_text(cand)
   if not text then return cand end
   local ok, c = pcall(function()
     local nc = Candidate(cand.type, cand.start, cand._end, text, '')
-    local preedit = raw or ''
-    local s, e = tonumber(cand.start), tonumber(cand._end)
-    if s and e and s >= 0 and e >= s and e <= #preedit then
-      preedit = preedit:sub(s + 1, e)
+    -- 预编辑兜底：
+    --   ① 空 → 用整串输入转符号；
+    --   ② 含数字（0-9，例如 custom_phrase 简码候选的原始编码 "31"）→ 同样重建。
+    -- 否则高亮这类候选时，librime 会把「31」直接显示在预编辑区。
+    local preedit = cand.preedit
+    if not preedit or preedit == '' or preedit:find('[0-9]') then
+      preedit = to_stroke_symbol(raw or '')
     end
-    nc.preedit = to_stroke_symbol(preedit)
+    nc.preedit = preedit
     return nc
   end)
   if ok and c then
@@ -218,8 +175,23 @@ local function filter(input, env)
       local text = get_cand_text(cand)
       if text then
         local n = char_count(text)
-        local expected_len = span_target(cand) or target_len
-        if n and n == expected_len then
+        -- 词长锁定只对「覆盖整段输入」的候选生效：
+        -- 多段 composition 时每个段的候选 end < #inpt，若仍按整串词长过滤，
+        -- 单段候选会被全部误杀 → 该段菜单元为空 → 元书回退显示原始数字。
+        local cs = tonumber(cand.start) or 0
+        local ce = tonumber(cand._end) or -1
+        local covers_all = (cs <= 0 and ce >= #inpt)
+        local expected_len = span_target(cand)
+        if not expected_len then
+          if covers_all then
+            expected_len = target_len
+          elseif n and n == 1 then
+            -- 多段 composition：每段只翻译自己的子串，候选不覆盖整串；
+            -- 单字候选一律放行，避免整串词长把各段候选误杀成空菜单（→ 回显数字）。
+            expected_len = 1
+          end
+        end
+        if not expected_len or (n and n == expected_len) then
           yield(clean_cand(cand, inpt))
           yielded_any = true
         else

@@ -18,6 +18,12 @@ local KEYCODES = {
   Enter = 0xFF0D,
 }
 
+-- 判断文本是否包含 CJK 汉字（连打只接力中文成句，避免误上屏 emoji/标点/颜文字）
+local function has_cjk(text)
+  if not text or text == '' then return false end
+  return text:find("[\228\184\128-\233\174\191]") ~= nil  -- U+4E00~U+9FFF UTF-8
+end
+
 local M = {}
 
 function M.init(env)
@@ -105,11 +111,12 @@ function M.func(key_event, env)
 
   -- 1. 优先原生提交：select(0) 选中当前候选 → 检查 commit_text 非空 → commit()。
   --    原生 commit 会写 Rime commit_history，predictor 能基于新词生成下一轮联想（连打不中断）。
+  --    防护：只接力含汉字的候选（emoji/标点/颜文字等非中文候选不参与连打，避免打断成句）。
   local native_ok = false
   pcall(function()
     if ctx:select(0) then
       local ct = ctx:get_commit_text() or ''
-      if ct ~= '' then
+      if ct ~= '' and has_cjk(ct) then
         ctx:commit()
         native_ok = true
       end

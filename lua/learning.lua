@@ -399,6 +399,23 @@ function M.demote(w, env)
   save()
 end
 
+-- 恢复被降权词的频次（重置排序键调用：撤销降权影响，恢复到降权前顺序）
+function M.undemote(w, env)
+  load(env)
+  if not w or w == '' then return end
+  local item = data[w]
+  if not item then return end
+  item.cnt = math.min(item.cnt * 2, MAX_UF)
+  if item.cnt < 1 then
+    data[w] = nil
+  else
+    item.last = os.time()
+  end
+  rebuild_indexes()
+  revision = revision + 1
+  save()
+end
+
 function M.attach(env)
   -- 挂到 env.engine（所有 Lua 组件共享同一 engine）供其他模块复用同一实例（避免 require 隔离）
   if env.engine then

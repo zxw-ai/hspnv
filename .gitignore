@@ -1,0 +1,7 @@
+# 本地用户数据 / 隐私内容，不上传
+personal_ngram.tsv
+*.userdb/
+predict.db
+*.gram
+lua/_backup/
+*.bak

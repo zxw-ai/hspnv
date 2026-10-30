@@ -34,6 +34,7 @@ switches:
 
 engine:
   processors:
+    - lua_processor@*switch_panel                  # 功能开关面板：F4 打开/关闭，数字键切换（皮肤「功能切换」键发送 F4）
     - lua_processor@*wanxiang.context_reorder*P  # 上下文调频
     - lua_processor@*wanxiang.super_sequence*P   # 手动排序：Ctrl+j 上移 / Control+k 下移 / Ctrl+l 重置 / Ctrl+p 置顶（对应皮肤「下移」「降权」键）
     - lua_processor@*auto_commit                  # 自动上屏：唯一候选 + 高置信首位（下一键顶功提交）
@@ -61,9 +62,21 @@ engine:
     - punct_translator
     - lua_translator@*wanxiang_super_calculator
     - lua_translator@*segment_phrase
-    - predict_translator                     # 万象同款 librime-predict：基于用户上屏历史 n-gram 预测（与自研联想并存，排在后面）
+    - lua_translator@*switch_panel_t             # 功能开关面板：输入面板标记时输出开关候选（独立翻译器模块）
+    # ── 以下三个翻译器默认禁用（P0 内存/启动优化，2026-10-30）────────────────
+    # 1) script_translator@gram：要构建 stroke_script.dict.yaml(15.6MB) 的 prism，
+    #    运行时再加载 stroke-zh-hans.gram(10.1MB)；自研 DP 已覆盖同功能。
+    # 2) predict_translator：predict.db(7.2MB)，与自研 predict_next 重复。
+    # 3) table_translator@ext：其成语主题与 lua 的 words_ext_chengyu 重复加载。
+    # 需要时取消对应行的注释即可（gram:/grammar:/ext: 段仍保留）。
+    # - script_translator@gram
+    # predict_translator 保留：它是「空输入预测段」的候选来源之一（自研 predict_next
+    # 也依赖该预测段存在），删掉可能导致空输入联想消失，故不动。
+    - predict_translator
+    # - table_translator@ext
   filters:
     - lua_filter@*filter_seg_count                 # 笔画分词过滤（保留原学习核心）
+    - lua_filter@*predict_next                     # 上屏自动预测增强：用户 bigram 直出 + 混合候选（必须靠前，注入候选才能走后面的字符集/简繁/去重过滤）
     - lua_filter@*wanxiang.charset_filter          # 字符集过滤
     - lua_filter@*wanxiang.custom_phrase           # 自定义置顶词
     - lua_filter@*wanxiang.context_reorder*F        # 上下文调频
@@ -74,11 +87,16 @@ engine:
     - lua_filter@*long_word_filter               # 长词优先（短码输入时多字词提前）
     - lua_filter@*demote_filter                     # 手动降权：降权词沉底/隐藏（任意候选生效）
     - uniquifier                                   # 去重
-    - lua_filter@*predict_next                     # 上屏自动预测增强：用户 bigram 直出 + 输入中融合 + 可选超时
+    - lua_filter@*switch_panel_f                   # 功能开关面板：面板模式只保留面板候选并设置标题（独立过滤器模块）
 
 speller:
   alphabet: "12345?'V"
-  delimiter: ' '
+  # delimiter 必须包含单引号「'」，否则 abc_segmentor 会在 ' 处断段，
+  # 且断段后从 ' 开始无法再成段（' 不在 alphabet 也不在 delimiter）：
+  #   → 第二个字之后的输入完全不翻译（候选为空、联想失效），
+  #   → 未被翻译的 '32'45… 直接以原始数字回显在预编辑区。
+  # 格式同万象：第一位<空格>，第二位<'>(手动分词符)。
+  delimiter: " '"
   auto_select: true   # Rime 原生：候选唯一时自动上屏（键道同样依赖此配置）
 
 menu:
@@ -95,9 +113,49 @@ translator:
   enable_encoder: false
   initial_quality: 1.0
 
+# 语法模型辅助翻译器（Rime 原生 script_translator）：
+# 词典 stroke_script（词组编码 = 每字笔画码 + ' 分隔），
+# 并用 stroke-zh-hans.gram 语言模型做上下文搭配打分（contextual_suggestions）。
+# initial_quality 设低，作为 Lua 主候选的补充（重复候选由 uniquifier 去重）。
+gram:
+  dictionary: stroke_script
+  prism: stroke_script
+  preedit_format:
+    - xlit/12345/一丨丿丶乛/
+  comment_format:
+    - erase/.*$/
+  enable_completion: false
+  enable_user_dict: false
+  enable_sentence: false
+  enable_encoder: false
+  contextual_suggestions: true
+  initial_quality: 0.15
+
+# Rime::Grammar 语言模型（由 wanxiang-lts-zh-hans.gram 提取重建，适合笔画词库）
+grammar:
+  language: stroke-zh-hans
+  collocation_max_length: 6
+  collocation_min_length: 2
+  collocation_penalty: -14
+  non_collocation_penalty: -6
+  weak_collocation_penalty: -100
+  rear_penalty: -18
+
+# 可选扩展词库（table_translator@ext 的配置；配合 engine.translators 中取消注释的
+# `- table_translator@ext` 使用）。扩展词库编码为每字笔画码 + ' 分隔。
+# 启用前先在 stroke_ext.dict.yaml 中取消想加载主题的 import_tables 注释。
+ext:
+  dictionary: stroke_ext
+  enable_completion: false
+  enable_user_dict: false
+  enable_encoder: false
+  initial_quality: 0.3
+
 predictor:
   db: predict.db
-  max_candidates: 9
+  # 原生 predictor 只作自研联想的「长尾补充」，排在自研候选之后（第 2 页起）。
+  # 9→6：每次空输入都要查 predict.db，iSH 上开销不小，且 6 条已足够覆盖用户历史长尾。
+  max_candidates: 6
   max_iterations: 10
 
 # 轻量级 n-gram 上下文联想（基于上屏词对学习，提升连续输入时候选精准度）
@@ -107,15 +165,47 @@ ngram:
   word_cap: 3            # 词级上下文分上限（相当于最多 3 次用户频次）
   char_weight: 100000    # 字级上下文分步长
   char_cap: 2            # 字级上下文分上限
+  tri_enable: true       # 用户三元组：前两个上屏词 -> 下一个词（联想最高优先级）
+  tri_cap: 2             # 三元组计数上限（防单条搭配霸榜）
+
+# 语言模型分（借鉴 Rime::Grammar / wanxiang-lts-zh-hans.gram 的 n-gram 搭配设计）：
+# 在联想候选排序中，用「离线 bigram/trigram + 词典 collocation」给候选词打分，
+# 使上下文搭配更自然的候选更靠前。数据源：next_words_big/tri（万象 ARPA Top50万）+ words。
+gram_model:
+  enable: false       # 默认关闭（2026-10-30）：gram_stroke 15MB + 2.4MB 词表只在预测排序里加小幅分，
+                      # 内存紧张时收益不划算。需要时改 true（会自动按需加载 gram_stroke）。
+  weight: 60000       # 语言模型分放大倍数（越大影响越强；建议 30000~100000）
+  collocation_min: 2  # 词典搭配最短字数
+  collocation_max: 6  # 词典搭配最长字数
+
+# 联想候选生成参数（segment_phrase.lua 读取；默认值即历史调优值）
+segment_phrase:
+  head_words_max: 30  # head_words 前缀桶最大匹配数（防候选池爆炸）
+  learn_max: 20      # 用户学习库联想最大匹配数（用户词库膨胀后仍保持候选池可控）
+  pre_rank: 60       # 粗排候选数（仅对前列做语言模型精排，控制 gram 查询量）
+  predict_max: 8     # 空输入联想候选数（一页 9 个，其余留给混合快捷候选）
+  debug_input: false # 排查用：true 时把每次按键的 input/ctx.input/段范围/候选数写入 bg5_input.log
+  word_uf_step: 30000   # 联想排序：用户上屏 1 次 ≈ 静态词频 30000（10 次封顶≈离线 bigram 首位）
+  char_uf_step: 100000  # 单字候选排序：用户上屏 1 次 ≈ 静态字频 100000
 
 # 上屏自动预测增强（候选输出状态机 + 混合候选）
 predict_next:
   enable: true            # 总开关（false 时过滤器完全透传）
   expire_seconds: 0        # 0=空输入预测不超时；>0 表示 commit 后 N 秒不再显示预测（候选区留白）
   inputting_fusion: true   # 输入中：用户历史词前缀融合（打下一字时提前命中）
+  inputting_min_len: 3     # 前缀融合最少输入位数（1~2 笔是首两笔选字黄金位，不融合）
+  max_user_next: 4         # 空输入时用户 bigram 直出上限
   mix_kaomoji: true        # 空输入预测末尾追加颜文字（路线 G 混合候选）
   mix_punct: true          # 空输入预测末尾追加常用标点快捷候选（，。？！……）
   mix_quick: true          # 空输入预测末尾追加常用语快捷候选（好的/收到/谢谢…，对标讯飞常用语面板）
+  mix_emoji: true          # 空输入预测末尾追加「词→emoji」联想（对标讯飞 emoji 联想词典：开心→😊）
+  # 混合候选预算：首页 = mix_page_size 个；真实联想最多占 mix_real_keep 个，其余名额才给快捷项
+  mix_page_size: 9
+  mix_real_keep: 6
+  mix_punct_max: 1
+  mix_quick_max: 2
+  mix_emoji_max: 1
+  mix_kaomoji_max: 1
 
 # 标点顶字（路线 C）：按标点键先提交高亮候选，再上屏标点
 punct_commit:
@@ -127,10 +217,18 @@ custom_phrase:
   dictionary: custom_phrase
   prism: stroke_custom_phrase
   enable_user_dict: false
-  enable_completion: true
+  # 关闭「前缀补全」：否则只打第一笔（如 1）时，所有以 1 开头的简码（11/12/13…）
+  # 都会被当成补全候选塞到最前面，把真正的单字候选（一/去/成…）挤掉，
+  # 表现为「按 1 首位却是『或者』（简码 11）」。简码要打满才命中。
+  enable_completion: false
   max_candidates: 10
-  always_show_comments: true
-  spelling_hints: 50
+  # 不显示编码提示：简码是数字（11/21/31/41），显示出来很像「输入了数字」。
+  always_show_comments: false
+  spelling_hints: 0
+  # 预编辑格式：简码候选的 preedit 默认是原始数字编码（如 31），
+  # 不转换的话，高亮该候选时预编辑区会显示「31」而不是「丿一」。
+  preedit_format:
+    - xlit/12345/一丨丿丶乛/
 
 # 简码配置（custom_phrase.lua 只读取插入位置与候选数；笔画方案未启用 abbrev 开关，不加载拼音简码）
 abbrev_phrase:
@@ -177,7 +275,7 @@ select_character:
 auto_commit:
   enable: true
   high_conf: true            # 高置信首位自动上屏总开关
-  high_conf_threshold: 0.6  # 首位置信度阈值（0~1，越大越保守，误上屏越少）
+  high_conf_threshold: 0.8  # 首位置信度阈值（0~1，越大越保守，误上屏越少）
 
 # 连打键上屏联想词（移植自万象 enable_predict_space 机制；连打键默认 Tab，皮肤第3行表情键发送）
 predict_space:
@@ -187,8 +285,8 @@ predict_space:
 
 # 长词优先（雾凇借鉴）：短码/前缀输入时把多字词提到第 idx 位之后
 long_word_filter:
-  count: 2    # 最多提升的词数
-  idx: 4      # 提升到第 idx 位起
+  count: 3    # 最多提升的词数（借鉴 one-hand 精简码短码优先：短码输入多提几个高频词）
+  idx: 3      # 提升到第 idx 位起
 
 # 字符集过滤（a=通用规范汉字表；fa/ha/ta=简繁系）
 charset_filter:
@@ -237,6 +335,21 @@ key_binder:
     - {when: always, toggle: ascii_punct, accept: Control+Shift+numbersign}
     - {when: always, toggle: s2t, accept: Control+Shift+4}
     - {when: always, toggle: s2t, accept: Control+Shift+dollar}
+    # ── 数字小键盘映射（借鉴 one-hand 单手笔顺输入法）────────────────────
+    # KP_1~5=笔画 1~5；KP_0=通配 ?；KP_.=分词键 '；KP_回车=空格确认；
+    # KP_-=退格删改；KP_+=下移选字；KP_/=中文逗号；KP_*=回车(原样上屏数字/编码)。
+    - {accept: KP_1, send: 1, when: always}
+    - {accept: KP_2, send: 2, when: always}
+    - {accept: KP_3, send: 3, when: always}
+    - {accept: KP_4, send: 4, when: always}
+    - {accept: KP_5, send: 5, when: always}
+    - {accept: KP_0, send: question, when: always}
+    - {accept: KP_Decimal, send: apostrophe, when: always}
+    - {accept: KP_Enter, send: space, when: has_menu}
+    - {accept: KP_Subtract, send: BackSpace, when: has_menu}
+    - {accept: KP_Add, send: Down, when: has_menu}
+    - {accept: KP_Divide, send: comma, when: always}
+    - {accept: KP_Multiply, send: Return, when: has_menu}
 
 punctuator:
   import_preset: default

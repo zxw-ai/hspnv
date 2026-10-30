@@ -11,9 +11,17 @@ local M = {}
 local loaded = false
 local data = {}         -- 前词..'\t'..后词 -> 次数
 local char_data = {}    -- 前词..'\t'..首字 -> 次数
+local tri_data = {}     -- 前二词..'\t'..前词..'\t'..后词 -> 次数（用户三元组）
+-- 个人语料种子（只读）：与用户实时学习分开存放，避免被写回用户文件
+local seed_data, seed_char, seed_tri = {}, {}, {}
+local by_prev = {}      -- 前词 -> {后词=次数} 索引（next_words 免全表遍历，长期使用性能优化）
+local by_prev_total = {} -- 前词 -> 总次数（条件概率 P(w|prev) 的分母）
+local by_prev2 = {}     -- 前二词..'\t'..前词 -> {后词=次数}（next_words3 索引）
 local path = nil
 local prev_commit = nil
+local prev2_commit = nil
 local last_commit = nil
+local tri_count = 0
 local save_counter = 0
 local SAVE_INTERVAL = 8
 
@@ -23,6 +31,9 @@ local WORD_STEP = 200000
 local WORD_CAP = 3
 local CHAR_STEP = 100000
 local CHAR_CAP = 2
+local TRI_ENABLE = true      -- 用户三元组（前两个词 -> 下一个词）
+local TRI_CAP = 2            -- 三元组次数上限（防止单条霸榜）
+local TRI_MAX_ENTRIES = 20000 -- 三元组条目上限（超出时丢弃只出现 1 次的旧搭配，控制内存与写盘）
 
 local function user_dir()
   if rime_api and rime_api.get_user_data_dir then
@@ -83,6 +94,57 @@ local function load_config(env)
   if v then CHAR_STEP = v end
   v = cfg:get_int("ngram/char_cap")
   if v then CHAR_CAP = v end
+  v = cfg:get_bool("ngram/tri_enable")
+  if v ~= nil then TRI_ENABLE = v end
+  v = cfg:get_int("ngram/tri_cap")
+  if v then TRI_CAP = v end
+end
+
+local function rebuild_tri_index()
+  by_prev2 = {}
+  local merged_tri = {}
+  for k, n in pairs(seed_tri) do merged_tri[k] = (merged_tri[k] or 0) + n end
+  for k, n in pairs(tri_data) do merged_tri[k] = (merged_tri[k] or 0) + n end
+  for k, n in pairs(merged_tri) do
+    local a, b, c = k:match('^([^\t]+)\t([^\t]+)\t([^\t]+)$')
+    if a and b and c then
+      local k2 = a .. '\t' .. b
+      local bp2 = by_prev2[k2]
+      if not bp2 then bp2 = {}; by_prev2[k2] = bp2 end
+      bp2[c] = n
+    end
+  end
+end
+
+-- 个人语料种子（tools/gen_personal_ngram.lua 生成）：
+-- 低权重并入用户上下文模型，作为冷启动时「像自己说话」的先验。
+-- 找不到文件时静默跳过（不影响正常使用）。
+local function load_personal_seed(d)
+  local paths = {}
+  if rime_api and rime_api.get_shared_data_dir then
+    local ok, sd = pcall(function() return rime_api:get_shared_data_dir() end)
+    if ok and sd and sd ~= '' then paths[#paths + 1] = sd .. '/personal_ngram.tsv' end
+  end
+  paths[#paths + 1] = d .. '/personal_ngram.tsv'
+  for _, p in ipairs(paths) do
+    local f = io.open(p, 'r')
+    if f then
+      for line in f:lines() do
+        local kind, a, b, n = line:match('^([WC])\t([^\t]+)\t([^\t]+)\t(%d+)$')
+        if kind == 'W' then
+          seed_data[a .. '\t' .. b] = tonumber(n)
+        elseif kind == 'C' then
+          seed_char[a .. '\t' .. b] = tonumber(n)
+        else
+          local t1, t2, t3, t4 = line:match('^T\t([^\t]+)\t([^\t]+)\t([^\t]+)\t(%d+)$')
+          if t1 then seed_tri[t1 .. '\t' .. t2 .. '\t' .. t3] = tonumber(t4) end
+        end
+      end
+      f:close()
+      return true
+    end
+  end
+  return false
 end
 
 local function load(env)
@@ -99,13 +161,38 @@ local function load(env)
         data[a .. '\t' .. b] = tonumber(n)
       elseif kind == 'C' then
         char_data[a .. '\t' .. b] = tonumber(n)
+      else
+        -- 三元组：T<p2><p1><w><n>
+        local c1, c2, c3, c4 = line:match('^T\t([^\t]+)\t([^\t]+)\t([^\t]+)\t(%d+)$')
+        if c1 then tri_data[c1 .. '\t' .. c2 .. '\t' .. c3] = tonumber(c4) end
       end
     end
     f:close()
   end
+  -- 个人语料种子（可选）
+  load_personal_seed(d)
+  -- 重建前词索引（next_words 免全表遍历；用户数据 + 个人语料种子合并）
+  by_prev = {}
+  by_prev_total = {}
+  local merged = {}
+  for k, n in pairs(seed_data) do merged[k] = (merged[k] or 0) + n end
+  for k, n in pairs(data) do merged[k] = (merged[k] or 0) + n end
+  for k, n in pairs(merged) do
+    local a, b = k:match('^([^\t]+)\t([^\t]+)$')
+    if a and b then
+      local bp = by_prev[a]
+      if not bp then bp = {}; by_prev[a] = bp end
+      bp[b] = n
+      by_prev_total[a] = (by_prev_total[a] or 0) + n
+    end
+  end
+  -- 重建三元组索引
+  rebuild_tri_index()
+  tri_count = 0
+  for _ in pairs(tri_data) do tri_count = tri_count + 1 end
 end
 
-local function safe_save(p, t1, t2)
+local function safe_save(p, t1, t2, t3)
   local tmp = p .. '.tmp.' .. tostring(math.random(100000, 999999))
   local f = nil
   local ok = pcall(function()
@@ -118,6 +205,10 @@ local function safe_save(p, t1, t2)
       local a, b = k:match('^([^\t]+)\t([^\t]+)$')
       if a and b then f:write('C\t', a, '\t', b, '\t', tostring(n), '\n') end
     end
+    for k, n in pairs(t3) do
+      local a, b, c = k:match('^([^\t]+)\t([^\t]+)\t([^\t]+)$')
+      if a and b and c then f:write('T\t', a, '\t', b, '\t', c, '\t', tostring(n), '\n') end
+    end
     f:close()
     f = nil
     os.rename(tmp, p)
@@ -127,13 +218,14 @@ local function safe_save(p, t1, t2)
 end
 
 local function save()
-  if path then safe_save(path, data, char_data) end
+  if path then safe_save(path, data, char_data, tri_data) end
 end
 
 function M.word_freq(prev, w, env)
   load(env)
   if not ENABLED or not prev or prev == '' or not w or w == '' then return 0 end
-  local n = data[prev .. '\t' .. w]
+  local k = prev .. '\t' .. w
+  local n = data[k] or seed_data[k]
   if n then return math.min(n, WORD_CAP) * WORD_STEP end
   return 0
 end
@@ -141,7 +233,8 @@ end
 function M.char_freq(prev, ch, env)
   load(env)
   if not ENABLED or not prev or prev == '' or not ch or ch == '' then return 0 end
-  local n = char_data[prev .. '\t' .. ch]
+  local k = prev .. '\t' .. ch
+  local n = char_data[k] or seed_char[k]
   if n then return math.min(n, CHAR_CAP) * CHAR_STEP end
   return 0
 end
@@ -153,29 +246,113 @@ function M.get_last_commit()
 end
 M.get_last_text = M.get_last_commit
 
+-- 前前一个上屏词（用户三元组的上下文）
+function M.get_prev2()
+  return prev2_commit
+end
+
 -- 获取某个前词在用户历史中的所有后接词（按次数降序）
 -- 供 predict_next（上屏自动预测增强）把用户个性化搭配直接作为候选输出。
 function M.next_words(prev, env)
   load(env)
   if not ENABLED or not prev or prev == '' then return {} end
-  local prefix = prev .. '\t'
+  local bp = by_prev[prev]
+  if not bp then return {} end
   local out = {}
-  for k, n in pairs(data) do
-    if k:sub(1, #prefix) == prefix then
-      out[#out + 1] = { word = k:sub(#prefix + 1), cnt = n }
-    end
+  for w, n in pairs(bp) do
+    out[#out + 1] = { word = w, cnt = n }
   end
-  table.sort(out, function(a, b) return a.cnt > b.cnt end)
+  -- 同次数时按词排序：Lua 的 pairs 顺序不稳定，不加 tie-break 会让同一份数据的
+  -- 联想顺序在两次启动间抖动（排序名次还会影响 sf 递减）。
+  table.sort(out, function(a, b)
+    if a.cnt ~= b.cnt then return a.cnt > b.cnt end
+    return a.word < b.word
+  end)
   return out
 end
 
-local function learn_pair(prev, cur)
+-- 条件概率 P(w | prev)（用户 bigram）；无记录返回 nil
+function M.pair_prob(prev, w, env)
+  load(env)
+  if not ENABLED or not prev or prev == '' or not w or w == '' then return nil end
+  local bp = by_prev[prev]
+  if not bp then return nil end
+  local n = bp[w]
+  local total = by_prev_total[prev]
+  if not n or not total or total <= 0 then return nil end
+  return n / total
+end
+
+-- 归一化条件概率：P(w|prev) × 后继词种类数（「比均匀分布好多少」，无信息时为 1）
+-- 返回 (norm, follower_count)
+function M.pair_prob_norm(prev, w, env)
+  load(env)
+  if not ENABLED or not prev or prev == '' or not w or w == '' then return nil end
+  local bp = by_prev[prev]
+  if not bp then return nil end
+  local n = bp[w]
+  local total = by_prev_total[prev]
+  if not n or not total or total <= 0 then return nil end
+  local k = 0
+  for _ in pairs(bp) do k = k + 1 end
+  return (n / total) * k, k
+end
+
+-- 获取「前两个词 -> 下一个词」的用户三元组（按次数降序）
+function M.next_words3(p2, p1, env)
+  load(env)
+  if not ENABLED or not TRI_ENABLE then return {} end
+  if not p2 or p2 == '' or not p1 or p1 == '' then return {} end
+  if is_punct(p2) or is_punct(p1) then return {} end
+  local bp2 = by_prev2[p2 .. '\t' .. p1]
+  if not bp2 then return {} end
+  local out = {}
+  for w, n in pairs(bp2) do
+    out[#out + 1] = { word = w, cnt = n }
+  end
+  table.sort(out, function(a, b)
+    if a.cnt ~= b.cnt then return a.cnt > b.cnt end
+    return a.word < b.word
+  end)
+  return out
+end
+
+-- 三元组次数上限（供上层换算分数时使用）
+function M.tri_cap() return TRI_CAP end
+
+local function learn_pair(prev, cur, p2)
   if not prev or prev == '' or not cur or cur == '' then return end
   -- 至少一方是中文词/字；不允许「标点 -> 标点」
   if not is_valid_unit(prev) or not is_valid_unit(cur) then return end
   if is_punct(prev) and is_punct(cur) then return end
   local wk = prev .. '\t' .. cur
   data[wk] = (data[wk] or 0) + 1
+  -- 同步更新前词索引
+  local bp = by_prev[prev]
+  if not bp then bp = {}; by_prev[prev] = bp end
+  bp[cur] = (bp[cur] or 0) + 1
+  by_prev_total[prev] = (by_prev_total[prev] or 0) + 1
+  -- 用户三元组：前两个词 -> 当前词（标点不参与，避免跨句噪声）
+  if TRI_ENABLE and p2 and p2 ~= '' and p2 ~= prev and not is_punct(p2) and not is_punct(cur) then
+    local tk = p2 .. '\t' .. prev .. '\t' .. cur
+    if tri_data[tk] == nil then tri_count = tri_count + 1 end
+    tri_data[tk] = (tri_data[tk] or 0) + 1
+    if tri_count > TRI_MAX_ENTRIES then
+      -- 超过上限：丢弃只出现 1 次的旧搭配，控制内存与写盘
+      local keep = {}
+      for k, n in pairs(tri_data) do
+        if n > 1 then keep[k] = n end
+      end
+      tri_data = keep
+      tri_count = 0
+      for _ in pairs(tri_data) do tri_count = tri_count + 1 end
+      rebuild_tri_index()
+    end
+    local k2 = p2 .. '\t' .. prev
+    local bp2 = by_prev2[k2]
+    if not bp2 then bp2 = {}; by_prev2[k2] = bp2 end
+    bp2[cur] = (bp2[cur] or 0) + 1
+  end
   -- 记录 前词 -> 当前词首字（标点也记录其本身作为“首字”，供 char_freq 查询）
   local chars = utf8_chars(cur)
   local first = chars[1]
@@ -191,6 +368,7 @@ function M.touch_context(text, env)
   load(env)
   if not text or text == '' then return end
   if not is_valid_unit(text) then return end
+  prev2_commit = prev_commit
   prev_commit = text
   last_commit = text
 end
@@ -203,8 +381,9 @@ function M.notify_commit(text, env)
   if not text or text == '' then return end
   if not is_valid_unit(text) then return end
   if prev_commit and prev_commit ~= text then
-    learn_pair(prev_commit, text)
+    learn_pair(prev_commit, text, prev2_commit)
   end
+  prev2_commit = prev_commit
   prev_commit = text
   last_commit = text
   save_counter = save_counter + 1
@@ -226,8 +405,9 @@ function M.attach(env)
     -- 纯中文词或标点都参与上下文学习
     if text ~= '' and is_valid_unit(text) then
       if prev_commit and prev_commit ~= text then
-        learn_pair(prev_commit, text)
+        learn_pair(prev_commit, text, prev2_commit)
       end
+      prev2_commit = prev_commit
       prev_commit = text
       last_commit = text
       save_counter = save_counter + 1

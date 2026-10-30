@@ -89,6 +89,7 @@ function M.func(key_event, env)
     return false
   end
   local function is_last_key()
+    -- 末键：分号键码（0x3b）；同时兼容 Control+bracketright 配置
     if keycode == 0x3b then return true end  -- 分号 ;
     if key_repr == last_key or key_repr == ';' or key_repr == 'Control+bracketright' then return true end
     return false

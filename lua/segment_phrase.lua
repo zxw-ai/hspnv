@@ -8,6 +8,21 @@
 
 local index = require('index')
 local words = require('words')
+-- 扩展词库接入 Lua 运行时词表（主题级开关）：
+-- lua/words_ext_config.lua 中 chengyu/renming/yixue/dili = true/false 控制各主题是否并入。
+local ok_cfg, words_ext_cfg = pcall(require, 'words_ext_config')
+local ext_cfg = ok_cfg and type(words_ext_cfg) == 'table' and words_ext_cfg or {}
+local ext_themes = { 'chengyu', 'renming', 'yixue', 'dili' }
+for _, theme in ipairs(ext_themes) do
+  if ext_cfg[theme] ~= false then
+    local ok_t, t = pcall(require, 'words_ext_' .. theme)
+    if ok_t and type(t) == 'table' then
+      for w, f in pairs(t) do
+        words[w] = f
+      end
+    end
+  end
+end
 local stroke = require('stroke')
 local learning = require('learning')
 -- 容错加载 ngram：即使 ngram 模块缺失/加载失败，也绝不影响笔画输入主流程
@@ -20,15 +35,47 @@ if not ok_ngram then
   }
 end
 local head_words = require('head_words')
+-- 带分词符的简码表（tools/gen_quick_codes.lua 生成，来自 custom_phrase.dict.yaml）
+-- 例：["1'1"] = {"或者","现在","需要"}；分词输入精确命中时置顶输出。
+local quick_codes = nil
+do
+  local ok, t = pcall(require, 'quick_codes')
+  if ok and type(t) == 'table' then quick_codes = t end
+end
+-- head_words 支持两种格式：
+--   ① 旧：{[首字] = {{词,频}, ...}}（19MB）
+--   ② 新：{[首字] = "词1\t频1|词2\t频2|..."}（2MB，tools/pack_head_words.lua 生成）
+-- 这里统一解析成数组并做小缓存，调用方不必关心格式。
+local hw_parse_cache = {}
+local HW_PARSE_CACHE_MAX = 64
+local function hw_bucket(first_ch)
+  if not first_ch or first_ch == '' then return {} end
+  local src = head_words[first_ch]
+  if not src then return {} end
+  if type(src) ~= 'string' then return src end
+  local cached = hw_parse_cache[first_ch]
+  if cached then return cached end
+  local out = {}
+  for item in src:gmatch('([^|]+)') do
+    local w, f = item:match('^([^\t]+)\t(%d+)$')
+    if w and f then out[#out + 1] = { w, tonumber(f) } end
+  end
+  if #hw_parse_cache >= HW_PARSE_CACHE_MAX then hw_parse_cache = {} end
+  hw_parse_cache[first_ch] = out
+  return out
+end
 local phrase_stroke_index = require('phrase_stroke_index')
 local next_words = require('next_words')
 local next_words_big = require('next_words_big')
 local next_words_tri = require('next_words_tri')
-local auto_segment = require('auto_segment')
 local phrase_assoc = require('phrase_assoc')
 local phrase_assoc_tri = require('phrase_assoc_tri')
 local phrase_assoc_quad = require('phrase_assoc_quad')
 local unigram_fallback = require('unigram_fallback')
+-- 预热加载语言模型分模块（gram_stroke 大表约 0.75s）：
+-- 若留到首次联想时才懒加载，会造成上屏后候选卡顿；
+-- 提前加载把开销转移到方案部署/输入法启动阶段（与 words 等大模块并行），打字时零卡顿。
+-- 语法模型按需加载（gram_model/enable=false 时完全不加载 gram_model 及其依赖）
 
 -- 用户频次权重步长（调整排序平衡）：
 -- WORD_UF_STEP：词候选排序中，用户上屏 1 次 ≈ 词库词频 30000（原 100000，避免一次误选就霸榜）
@@ -57,10 +104,70 @@ local WEIGHTS = {
   sf_open      = 520000,
   sf_tri       = 500000,
   sf_quad      = 550000,
+  sf_usertri   = 600000,   -- 用户三元组（前两个词 -> 下一词），最高优先
   sf_tailword  = 150000,
 }
 local WORD_UF_STEP = WEIGHTS.uf_step
 local CHAR_UF_STEP = WEIGHTS.char_uf_step
+
+-- ===== 可配置参数（默认 = 历史硬编码值；由 load_settings 从 schema 惰性加载一次） =====
+local HEAD_WORDS_MAX = 30
+local LEARN_MAX = 20
+local PRE_RANK = 60
+local PREDICT_MAX = 8       -- 空输入联想候选数（menu/page_size 一页 9 个，留 1 位给 predict_next 混合候选）
+local GRAM_ENABLE = false
+local GRAM_WEIGHT = 60000
+local gram_model_ref = nil
+local gram_model_ok = false
+local settings_loaded = false
+local DEBUG_INPUT = false   -- segment_phrase/debug_input：把每次按键的 input/seg 写入日志，排查用
+
+local function load_settings(env)
+  if settings_loaded then return end
+  local cfg = env and env.engine and env.engine.schema and env.engine.schema.config
+  if not cfg then
+    GRAM_ENABLE = true  -- 无 schema 环境（测试/降级）保持原逻辑：gram 默认启用
+    return
+  end
+  pcall(function()
+    -- 上下文步长（ngram 专用）与「用户词频步长」（排序专用）是两个不同概念：
+    -- ngram/word_weight 决定「上一个词 → 候选」的上下文分强度；
+    -- segment_phrase/word_uf_step 决定「用户上屏次数」的个性化强度。
+    -- 早前两者共用 ngram/word_weight（200000），导致用户只上屏过一两次的词（uf*200000）
+    -- 直接压过离线 bigram 与上下文分，联想变成「个人高频词榜」而不是「语境接续」。
+    local wu = cfg:get_int('segment_phrase/word_uf_step')
+    if wu and wu > 0 then WORD_UF_STEP = wu end
+    local cu = cfg:get_int('segment_phrase/char_uf_step')
+    if cu and cu > 0 then CHAR_UF_STEP = cu end
+    local dbg = cfg:get_bool('segment_phrase/debug_input')
+    if dbg ~= nil then DEBUG_INPUT = dbg end
+    local pm = cfg:get_int('segment_phrase/predict_max')
+    if pm and pm > 0 then PREDICT_MAX = pm end
+    local h = cfg:get_int('segment_phrase/head_words_max')
+    if h and h > 0 then HEAD_WORDS_MAX = h end
+    local l = cfg:get_int('segment_phrase/learn_max')
+    if l and l > 0 then LEARN_MAX = l end
+    local p = cfg:get_int('segment_phrase/pre_rank')
+    if p and p > 0 then PRE_RANK = p end
+    local g = cfg:get_bool('gram_model/enable')
+    if g ~= nil then GRAM_ENABLE = g end
+    local gw = cfg:get_int('gram_model/weight')
+    if gw then GRAM_WEIGHT = gw end
+    -- 只有 enable=true 才加载 gram_model（它会连带加载 next_words_* 和 gram_stroke）
+    if GRAM_ENABLE then
+      local ok_gm, gm = pcall(require, 'gram_model')
+      gram_model_ok = ok_gm and type(gm) == 'table'
+      gram_model_ref = gram_model_ok and gm or nil
+      if gram_model_ok then
+        local cmin = cfg:get_int('gram_model/collocation_min')
+        local cmax = cfg:get_int('gram_model/collocation_max')
+        gram_model_ref.configure({ collocation_min = cmin, collocation_max = cmax })
+      end
+    end
+    settings_loaded = true
+  end)
+end
+
 -- =============================================================================
 -- 候选惩罚表（对标讯飞 PenaltyMap：配置化「减分」项，调优只需改本表）
 --   recent_repeat_factor : 近期重复词的削弱倍率（循环抑制，<1 为减权）
@@ -73,30 +180,40 @@ local PENALTIES = {
   overlong = 2000,
 }
 -- 分词联想上限：预编辑区超过 N 个分词符时不再联想更长词（防爆上限）
-local MAX_WORD_LEN = 8
+local MAX_WORD_LEN = 12
 
 -- 共享模块表：挂到 env 供其他模块（如 predict_space）复用同一实例（避免 require 隔离）
 local M = {}
 
 local MAX_PREFIX = 96
 local MAX_STATES = 8000
-local MAX_OUTPUT = 150
+local MAX_OUTPUT = 60
 
 local attached = setmetatable({}, { __mode = 'k' })
 local cache = setmetatable({}, { __mode = 'k' })
 local cache_rev = setmetatable({}, { __mode = 'k' })
 
--- 候选层级：单笔画符号顶格；普通字与词语先出；部件/部首仅完整笔顺后出现。
-local STROKE_SYMBOLS = { ["一"] = true, ["丨"] = true, ["丿"] = true, ["丶"] = true, ["乙"] = true }
+-- 候选层级：普通字与词语先出；偏旁部首和笔画符号不参与候选（用户要求排除）。
+-- 「一」是常用汉字，保留；其余单笔符号（丨丿丶乙亅乀乁乚乛）与偏旁部首全部排除。
+local STROKE_SYMBOLS = { ["一"] = true }
 local PRIORITY_COMPONENTS = {}
 for ch in ("一丨丿丶乙氵亻艹扌辶讠纟饣忄阝宀疒礻衤钅彳犭夂攵冖冂勹匚廴彡卩厶巛灬爫户戈攴疋癶缶聿艮豸"):gmatch("[\1-\127\194-\244][\128-\191]*") do
   PRIORITY_COMPONENTS[ch] = true
 end
--- 部件提前提示（③，对标讯飞 SPZ 字根提前展开的轻量版）：
--- 输入常用偏旁/部首的前 N 笔时，提前把该部件作为候选显示（低 rank，不抢精确位）。
--- rank 设计：精确(0) < 提前部件(1200) < 笔画纠错(1500) < 普通前缀桶(2000+)
-local COMPONENT_EARLY_RANK = 1200
-local COMPONENT_EARLY_MIN = 2   -- 至少输入 2 笔才提前提示（单笔不提示，避免干扰）
+-- 非独立汉字的部首/笔画符号集合（不参与候选与预测）：
+-- 偏旁部首 + 单笔符号（保留常用字「一」）
+local NON_WORD_CHARS = {}
+for ch in ("丨丿丶乙亅乀乁乚乛"):gmatch("[\1-\127\194-\244][\128-\191]*") do
+  NON_WORD_CHARS[ch] = true
+end
+for ch in ("氵亻艹扌辶讠纟饣忄阝宀疒礻衤钅彳犭夂攵冖冂勹匚廴彡卩厶巛灬爫户戈攴疋癶缶聿艮豸"):gmatch("[\1-\127\194-\244][\128-\191]*") do
+  NON_WORD_CHARS[ch] = true
+end
+-- 部首/符号单字判定（用于预测/联想输出过滤）
+local function is_component_char(w)
+  if #w ~= 3 then return false end  -- 单字（UTF-8 恰好 3 字节）
+  return NON_WORD_CHARS[w] or false
+end
 -- 模糊笔画：开启后「折(5) ≈ 竖(2)」容错（常见笔顺混淆）。
 -- 用于完整码精确匹配与词匹配（prefix_match）；前缀 Trie 桶保持严格匹配以控制候选噪音。
 local fuzzy_stroke_on = false
@@ -217,8 +334,59 @@ end
 table.sort(sorted_chars, function(a, b)
   return (char_freq[a] or 0) > (char_freq[b] or 0)
 end)
+-- 按首笔分桶（通配符检索只需扫描对应首笔的字，避免全表 8348 次模式匹配）
+local stroke_by_first = {}
+for _, ch in ipairs(sorted_chars) do
+  local code = stroke[ch]
+  if code and code ~= '' then
+    local f = code:sub(1, 1)
+    local t = stroke_by_first[f]
+    if not t then t = {}; stroke_by_first[f] = t end
+    t[#t + 1] = ch
+  end
+end
+
 local bucket_cache = {}
+local bucket_order = {}
 local BUCKET_CACHE_MAX = 1024
+local bucket_count = 0
+-- 一阶 Trie 桶（5 个）的磁盘缓存：它们是唯一的「全表扫描」，缓存后每次启动的首键不再重建
+local bucket_cache_loaded = false
+local function bucket_cache_path()
+  local d = rime_api and rime_api.get_user_data_dir and rime_api:get_user_data_dir()
+  if d and d ~= '' then return d .. '/bg5_bucket_cache.tsv' end
+  return nil
+end
+local function load_bucket_cache()
+  if bucket_cache_loaded then return end
+  bucket_cache_loaded = true
+  local pth = bucket_cache_path()
+  if not pth then return end
+  local f = io.open(pth, 'r')
+  if not f then return end
+  local first = f:read('l')
+  if first ~= ('#v1 ' .. tostring(#sorted_chars)) then f:close() return end
+  for line in f:lines() do
+    local seg, chars = line:match('^(.-)\t(.+)$')
+    if seg and chars and #seg <= 1 then
+      local arr = {}
+      for ch in chars:gmatch("[\1-\127\194-\244][\128-\191]*") do arr[#arr + 1] = ch end
+      if #arr > 0 then bucket_cache[seg] = arr; bucket_count = bucket_count + 1 end
+    end
+  end
+  f:close()
+end
+local function save_bucket_cache()
+  local pth = bucket_cache_path()
+  if not pth then return end
+  local f = io.open(pth, 'w')
+  if not f then return end
+  f:write('#v1 ', tostring(#sorted_chars), '\n')
+  for seg, arr in pairs(bucket_cache) do
+    if #seg <= 1 then f:write(seg, '\t', table.concat(arr), '\n') end
+  end
+  f:close()
+end
 local function build_bucket_full(seg)
   -- 全量返回（预排序），父桶过滤才能逐级保留低频常用字（如「审」在 4 前缀 300 名外也必须进入 44 桶）
   local arr = {}
@@ -232,9 +400,15 @@ local function build_bucket_full(seg)
 end
 local function get_bucket(seg)
   if not seg or seg == '' then return {} end
+  load_bucket_cache()
   local cached = bucket_cache[seg]
   if cached then return cached end
   local parent = seg:sub(1, -2)
+  -- 先保证父桶存在（一路回溯到 1 笔桶）：这样「全表扫描」只在 1 笔桶发生一次，
+  -- 深层前缀都是父桶过滤，且 1 笔桶会落盘缓存，下次启动直接命中。
+  if parent ~= '' and not bucket_cache[parent] then
+    get_bucket(parent)
+  end
   local parent_bucket = bucket_cache[parent]
   local bucket
   if parent_bucket then
@@ -249,12 +423,19 @@ local function get_bucket(seg)
   else
     bucket = build_bucket_full(seg)
   end
-  local n = 0
-  for _ in pairs(bucket_cache) do n = n + 1 end
-  if n >= BUCKET_CACHE_MAX then
-    bucket_cache = {}
-  end
   bucket_cache[seg] = bucket
+  bucket_count = bucket_count + 1
+  bucket_order[#bucket_order + 1] = seg
+  -- FIFO 淘汰（原先满了直接清空，导致缓存抖动）
+  while bucket_count > BUCKET_CACHE_MAX do
+    local old_seg = table.remove(bucket_order, 1)
+    if not old_seg then break end
+    if bucket_cache[old_seg] and old_seg ~= seg then
+      bucket_cache[old_seg] = nil
+      bucket_count = bucket_count - 1
+    end
+  end
+  if #seg <= 1 then save_bucket_cache() end
   return bucket
 end
 -- 预构建 1-5 首笔桶，保证第一笔输入零卡顿
@@ -456,6 +637,7 @@ local function slice_phrase_bucket(parts)
 end
 
 local function init(env)
+  load_settings(env)
   -- 挂到 env.engine（所有 Lua 组件共享同一 engine）供 predict_space 等复用同一实例
   if env.engine then
     env.engine.bg5_segment_phrase = M
@@ -497,62 +679,18 @@ local function utf8_first_char(s)
   return s:match("^[\1-\127\194-\244][\128-\191]*")
 end
 
-local function to_stroke_symbol(s)
-  if not s then return "" end
-  -- 分词符 ' 必须保留（讯飞式：词组未上屏前，分词符一直显示在笔画串中）
-  return s:gsub("1", "一"):gsub("2", "丨"):gsub("3", "丿"):gsub("4", "丶"):gsub("5", "乛"):gsub("[^一丨丿丶乛']", "？")
-end
+local preedit_util = require('preedit_util')
+local function to_stroke_symbol(s) return preedit_util.to_stroke_symbol(s) end
+local function force_preedit(env, inpt) preedit_util.set_preedit(env, inpt) end
 
--- 强制把 composition 各输入段的 preedit 都设为对应子串的笔画符号
--- （防止「输入段 + 预测段」多段并存时，只设置了最后一段导致输入段回退显示原始数字）。
--- 正确 API：Composition:toSegmentation():get_segments() 返回真实段指针数组（vector<Segment*>），
--- 修改段.preedit 会写回 C++ 对象；兼容旧版 librime-lua 退化为 back()。
--- 只处理「有实际输入范围」的段（en > st），预测段/占位段（st==en）不设置，避免干扰拼接。
-local function force_preedit(env, inpt)
-  if not env or not inpt or inpt == '' then return end
-  local ctx = env.engine and env.engine.context
-  if not ctx then return end
-  local comp = ctx.composition
-  if not comp or comp:empty() then return end
-  local function apply(seg)
-    if type(seg) ~= 'table' then return end
-    local st, en = seg.start, seg._end
-    if st == nil then st = seg._start end
-    if st == nil or en == nil then return end
-    if en > st and st >= 0 and en <= #inpt then
-      local sub = inpt:sub(st + 1, en)
-      pcall(function() seg.preedit = to_stroke_symbol(sub) end)
-    end
-  end
-  -- 1. 新版 API：Composition -> Segmentation -> 全部真实段指针
-  local ok, segm = pcall(function() return comp:toSegmentation() end)
-  if ok and segm then
-    local ok2, segs = pcall(function() return segm:get_segments() end)
-    if ok2 and type(segs) == 'table' then
-      for _, s in ipairs(segs) do
-        apply(s)
-      end
-    end
-  end
-  -- 2. 直接尝试 Composition:get_segments（部分实现可能暴露）
-  local ok3, segs3 = pcall(function() return comp:get_segments() end)
-  if ok3 and type(segs3) == 'table' then
-    for _, s in ipairs(segs3) do
-      apply(s)
-    end
-  end
-  -- 3. 兜底：设置最后一段（旧 API 或上述失败时仍保证输入段生效）
-  apply(comp:back())
-end
 
 local function make_candidate(type, start, _end, text, raw_input)
   local c = Candidate(type, start, _end, text, '')
-  local preedit = raw_input or ''
-  local s, e = tonumber(start), tonumber(_end)
-  if s and e and s >= 0 and e >= s and e <= #preedit then
-    preedit = preedit:sub(s + 1, e)
-  end
-  c.preedit = to_stroke_symbol(preedit)
+  -- 预编辑一律用「本翻译器收到的整串输入」转符号，不按候选跨度截取。
+  -- 原因：librime 的 GetPreedit 在候选 preedit 为空时会回退显示原始编码（阿拉伯数字），
+  -- 而按跨度截取在「空跨度 / 跨度越界 / 多段」时都会截出空串 → 预编辑区露出数字。
+  -- 整串转换可以保证：只要这一轮有输入，就一定显示笔画符号。
+  c.preedit = to_stroke_symbol(raw_input or '')
   return c
 end
 
@@ -588,15 +726,19 @@ local function chars_for(seg, env)
 
   local out, seen = {}, {}
   local function add_char(ch, exact, rank)
-    local is_component = PRIORITY_COMPONENTS[ch] and not STROKE_SYMBOLS[ch]
-    if is_component and stroke[ch] ~= seg then return end
-    add_unique(out, seen, ch, exact, rank, is_component or false)
+    -- 排除部首/笔画符号参与候选（用户要求）：偏旁部首 + 非「一」的单笔符号一律不显示。
+    if NON_WORD_CHARS[ch] then return end
+    add_unique(out, seen, ch, exact, rank, false)
   end
 
-  -- 0. 通配检索：段内含 ? 时，? 匹配任意一笔（1-5），全量扫描命中所有可能字
+  -- 0. 通配检索：段内含 ? 时，? 匹配任意一笔（1-5）
   if seg:find("?", 1, true) then
     local pat = "^" .. seg:gsub("%?", "[12345]")
-    for ch, code in pairs(stroke) do
+    -- 按首笔分桶：4? 只需扫以 4 开头的字（1/5），比全表 8348 快 5 倍
+    local first = seg:sub(1, 1)
+    local scan = (first ~= '?') and (stroke_by_first[first] or {}) or sorted_chars
+    for _, ch in ipairs(scan) do
+      local code = stroke[ch]
       if code and code:match(pat) then
         if not PRIORITY_COMPONENTS[ch] then
           add_unique(out, seen, ch, false, 3000)
@@ -604,13 +746,18 @@ local function chars_for(seg, env)
       end
     end
     local last = learning.get_last_commit() or ''
+    -- 预计算分数：原来每个比较都要调 4 次 learning/ngram 查询，
+    -- 通配符一次有上千候选 → 比较次数上万，首用会卡 600ms（P2 优化）
+    for _, it in ipairs(out) do
+      local af = learning.freq(it.ch, env)
+      local acf = ngram.char_freq(last, it.ch, env)
+      it._u = af * CHAR_UF_STEP + acf
+      it._cf = char_freq[it.ch] or 0
+    end
     table.sort(out, function(a, b)
       if a.component ~= b.component then return a.component end
-      local af, bf = learning.freq(a.ch, env), learning.freq(b.ch, env)
-      local acf, bcf = ngram.char_freq(last, a.ch, env), ngram.char_freq(last, b.ch, env)
-      if af * CHAR_UF_STEP + acf ~= bf * CHAR_UF_STEP + bcf then return af * CHAR_UF_STEP + acf > bf * CHAR_UF_STEP + bcf end
-      local af2, bf2 = char_freq[a.ch] or 0, char_freq[b.ch] or 0
-      if af2 ~= bf2 then return af2 > bf2 end
+      if a._u ~= b._u then return a._u > b._u end
+      if a._cf ~= b._cf then return a._cf > b._cf end
       if a.rank ~= b.rank then return a.rank < b.rank end
       return a.ch < b.ch
     end)
@@ -633,7 +780,9 @@ local function chars_for(seg, env)
 
   -- 1.5 局部纠错候选（路线3）：易混笔画单位置替换的精确命中字，作为补充
   -- rank=1500：精确(0) < 纠错(1500) < 普通前缀桶(2000+)，精确码永远优先。
-  if correction_stroke_on then
+  -- 首两笔选字优化：短码（<=2笔）时跳过纠错，避免 44 -> 人/入/八/又 等非前缀字抢位，
+  -- 让前缀桶的「以该两笔开头」常用字直接顶格（配合《首两笔速查手册》）。
+  if correction_stroke_on and #seg > 2 then
     local variants = correction_variants(seg)
     for _, var in ipairs(variants) do
       local corr_list = exact_stroke[var]
@@ -650,18 +799,6 @@ local function chars_for(seg, env)
     local code = stroke[ch]
     if code and (fuzzy_code(code) == fuzzy_code(seg) or fuzzy_code(code):sub(1, #seg) == fuzzy_code(seg)) then
       add_char(ch, fuzzy_code(code) == fuzzy_code(seg), 0)
-    end
-  end
-
-  -- 部件注入：完整码精确显示（component 顶格）；前 COMPONENT_EARLY_MIN 笔起提前提示（低 rank，不抢精确位）。
-  for ch in pairs(PRIORITY_COMPONENTS) do
-    local code = stroke[ch]
-    if complete_component(ch, code, seg) then
-      add_unique(out, seen, ch, true, 900000, true)
-    elseif code and COMPONENT_EARLY_MIN > 0 and not seg:find("?", 1, true)
-        and #seg >= COMPONENT_EARLY_MIN and #code > #seg and code:sub(1, #seg) == seg then
-      -- 提前提示：当作普通候选（component=false，避免因部件优先而跳顶），rank 介于精确与纠错之间
-      add_unique(out, seen, ch, false, COMPONENT_EARLY_RANK, false)
     end
   end
 
@@ -687,13 +824,22 @@ local function chars_for(seg, env)
   end
 
   local last = learning.get_last_commit() or ''
+  -- 首两笔选字优化：短码（<=2笔）时不把精确命中字无条件顶格，
+  -- 而是按「学习频次 + 上下文 + 静态字频」综合排序，让高频字（都/要/下…）直接进候选。
+  local short_code = #seg <= 2
   table.sort(out, function(a, b)
     if a.stroke_symbol ~= b.stroke_symbol then return a.stroke_symbol end
     if a.component ~= b.component then return not a.component end
-    if a.exact ~= b.exact then return a.exact end
+    if not short_code and a.exact ~= b.exact then return a.exact end
     local af, bf = learning.freq(a.ch, env), learning.freq(b.ch, env)
     local acf, bcf = ngram.char_freq(last, a.ch, env), ngram.char_freq(last, b.ch, env)
-    if af * CHAR_UF_STEP + acf ~= bf * CHAR_UF_STEP + bcf then return af * CHAR_UF_STEP + acf > bf * CHAR_UF_STEP + bcf end
+    if short_code then
+      local sa = af * CHAR_UF_STEP + acf + (char_freq[a.ch] or 0)
+      local sb = bf * CHAR_UF_STEP + bcf + (char_freq[b.ch] or 0)
+      if sa ~= sb then return sa > sb end
+    else
+      if af * CHAR_UF_STEP + acf ~= bf * CHAR_UF_STEP + bcf then return af * CHAR_UF_STEP + acf > bf * CHAR_UF_STEP + bcf end
+    end
     -- 完整部件只在完整编码后出现；普通字与学习频次先参与排序。
     if a.rank ~= b.rank then return a.rank < b.rank end
     return a.ch < b.ch
@@ -723,8 +869,24 @@ local function emit_single(input, seg, env)
     end
   end
 
-  -- 候选层级：单笔画顶格 → 完全码偏旁部首 → 完全码普通字 → 其他高频字（无分词时只出单字，不出多字词）
+  -- 首两笔选字优化：短码（<=2笔）时不再把精确命中字顶格，
+  -- 直接按 chars_for 的综合词频顺序输出（配合《首两笔速查手册》高频字优先）。
   local emitted = 0
+  if #input <= 2 then
+    for _, item in ipairs(chars) do
+      if item.stroke_symbol then
+        yield(make_candidate('single', seg.start, seg._end, item.ch, input))
+        emitted = emitted + 1
+      elseif not item.component then
+        if emitted >= 9 then break end
+        yield(make_candidate('single', seg.start, seg._end, item.ch, input))
+        emitted = emitted + 1
+      end
+    end
+    return
+  end
+
+  -- 候选层级：单笔画顶格 → 完全码偏旁部首 → 完全码普通字 → 其他高频字（无分词时只出单字，不出多字词）
   local symbols, comp_exacts, exacts, others = {}, {}, {}, {}
   for _, item in ipairs(chars) do
     if item.stroke_symbol then
@@ -922,6 +1084,194 @@ end
 
 -- 动态分词组词输出：target_len 严格按分词次数锁定
 -- full_len: Rime 分段模式下传入完整输入长度（用于跨段词组候选的 end）；不分段时传 nil
+-- 计算 raw_input 中每一段（按 ' 分隔）在整体输入中的字节偏移（0-based，供候选独立提交用）
+local function compute_part_offsets(raw_input)
+  local offsets = {}
+  local pos = 1
+  for p in raw_input:gmatch("[^']+") do
+    local idx = raw_input:find(p, pos, true)
+    if idx then
+      -- Rime Candidate.end 是右开位置；非末段词连同其后的分隔符一起消费，
+      -- 这样点选前段词后，剩余 composition 从下一段笔画开始。
+      local e = idx + #p - 1
+      if raw_input:sub(e + 1, e + 1) == "'" then e = e + 1 end
+      offsets[#offsets + 1] = { start = idx - 1, _end = e }
+      pos = idx + #p + 1
+    end
+  end
+  return offsets
+end
+
+-- 句子级动态规划解码（v2，真概率版）：
+--   用 log10 概率打分，字/词同一量纲：
+--     score(词) = log10 P(w) + W_CTX * log10(P(w|prev)/均匀) + W_UF * log10(1+uf)
+--     score(字) = log10 P(ch) + W_CTX * ctx(ch) + W_UF * log10(1+uf)
+--   这样「拆成单字」与「合成一个词」的比较等价于 PMI 判断，不再靠常数硬凑。
+local LM = nil
+pcall(function() LM = require('lm') end)
+local LM_CTX_W = 0.7
+local LM_UF_W = 0.15
+local LM_LEN_BONUS = 0.30   -- 每多一个字成词的最小长度先验（倾向成词，但可被概率否决）
+local LOG10 = math.log10
+
+local function lm_ctx(prev_word, w, env)
+  if not LM or not LM.p_ctx or not prev_word or prev_word == '' then return 0 end
+  local ok, v = pcall(LM.p_ctx, prev_word, w, env)
+  if ok and v then return v end
+  return 0
+end
+
+local function lm_word_score(w, env, fallback_freq)
+  local base = -12
+  if LM and LM.p_word_fallback then
+    local ok, v = pcall(LM.p_word_fallback, w, fallback_freq)
+    if ok and v then base = v end
+  elseif LM and LM.p_word then
+    local ok, v = pcall(LM.p_word, w)
+    if ok and v then base = v end
+  end
+  return base + LM_UF_W * LOG10(1 + (learning.freq(w, env) or 0))
+end
+
+local function lm_char_score(ch, env)
+  local base = -12
+  if LM and LM.p_char then
+    local ok, v = pcall(LM.p_char, ch)
+    if ok and v then base = v end
+  end
+  return base + LM_UF_W * LOG10(1 + (learning.freq(ch, env) or 0))
+end
+
+local sentence_cache_key, sentence_cache_val = nil, nil
+local function decode_sentence(parts, env)
+  local n = #parts
+  if n < 2 or n > 12 then return nil end
+  local ck = table.concat(parts, "'") .. '\1' .. tostring(learning.revision and learning.revision() or 0)
+  if sentence_cache_key == ck then return sentence_cache_val end
+  for _, pp in ipairs(parts) do
+    if pp:find("?", 1, true) then return nil end
+  end
+  local last = learning.get_last_commit() or ''
+  local best = { [0] = { score = 0, text = '', segs = {}, last_word = last } }
+  -- 单字候选池：先放「完整码精确字」（几/了 这类字在 chars_for 的按词频排序里可能被挤到很后），
+  -- 再补 chars_for 前若干个；去重后按语言模型概率重排。
+  local function char_pool(part)
+    local cands, seen = {}, {}
+    local function add(ch)
+      if not ch or seen[ch] then return end
+      if NON_WORD_CHARS[ch] or PRIORITY_COMPONENTS[ch] then return end
+      seen[ch] = true
+      cands[#cands + 1] = ch
+    end
+    local ex = nil
+    if fuzzy_stroke_on then ex = fuzzy_exact_stroke[fuzzy_code(part)] else ex = exact_stroke[part] end
+    if ex then
+      for _, ch in ipairs(ex) do add(ch) end
+    end
+    -- 用 index 表（小、常驻）补候选，避免为每个段构建 Trie 桶（那是 DP 的主要开销）
+    local indexed = index[part]
+    if indexed then
+      for i = 1, math.min(#indexed, 20) do add(indexed[i][1]) end
+    end
+    -- 用户在当前前缀下学过的字（通常很少；不在这里截断，避免依赖 pairs 的哈希顺序）
+    for ch in pairs(learning.all_chars(env)) do
+      local code = stroke[ch]
+      if code and code:sub(1, #part) == part then add(ch) end
+    end
+    return cands
+  end
+
+  local function top_chars(part, limit)
+    local cands = char_pool(part)
+    table.sort(cands, function(a, b)
+      local sa, sb = lm_char_score(a, env), lm_char_score(b, env)
+      if sa ~= sb then return sa > sb end
+      return a < b   -- 同分时按字符排序，保证结果确定（Lua 的 sort 不稳定）
+    end)
+    local out = {}
+    for i = 1, math.min(#cands, limit or 2) do out[i] = cands[i] end
+    return out
+  end
+  for i = 1, n do
+    local cur = nil
+    for k = 1, math.min(4, i) do
+      local prev = best[i - k]
+      if prev then
+        -- 每个跨度取前 2 个候选（单字取前 2 个字，词取索引前 2 个词）
+        local vec = {}
+        if k == 1 then
+          for _, ch in ipairs(top_chars(parts[i], 3)) do
+            vec[#vec + 1] = { text = ch, score = lm_char_score(ch, env) + LM_CTX_W * lm_ctx(prev.last_word, ch, env) }
+          end
+        else
+          local key = {}
+          for j = i - k + 1, i do key[#key + 1] = parts[j] end
+          local list = phrase_stroke_index[table.concat(key, "'")]
+          if list then
+            for idx = 1, math.min(#list, 2) do
+              local w = list[idx][1]
+              if w and w ~= '' then
+                vec[#vec + 1] = { text = w, score = lm_word_score(w, env, list[idx][2]) + LM_CTX_W * lm_ctx(prev.last_word, w, env) + LM_LEN_BONUS * (k - 1) }
+              end
+            end
+          end
+        end
+        for _, cand in ipairs(vec) do
+          local total = prev.score + cand.score
+          if not cur or total > cur.score then
+            local segs = {}
+            for _, x in ipairs(prev.segs) do segs[#segs + 1] = x end
+            segs[#segs + 1] = { text = cand.text, from = i - k + 1, to = i }
+            cur = { score = total, text = prev.text .. cand.text, segs = segs, last_word = cand.text }
+          end
+        end
+      end
+    end
+    best[i] = cur
+  end
+  local res = best[n]
+  -- 后处理：只在「与前后词能组成词」时才改单字（如「明天早上 [八] 点」→ 八点），
+  -- 纯字频更高不足以推翻 DP 的选择。注意必须「先收集全部候选再比较」，
+  -- 不能边遍历边用 margin 覆盖——char_pool 的顺序受 Lua 哈希随机化影响，会导致结果抖动。
+  if res then
+    for idx, sg in ipairs(res.segs) do
+      if sg.from == sg.to then
+        local prev_w = (idx > 1) and res.segs[idx - 1].text or last
+        local next_w = res.segs[idx + 1] and res.segs[idx + 1].text
+        local orig_sc = lm_char_score(sg.text, env) + LM_CTX_W * lm_ctx(prev_w, sg.text, env)
+        local best_ch, best_sc = nil, nil
+        local pool = char_pool(parts[sg.from])
+        for _, ch in ipairs(pool) do
+          if ch ~= sg.text then
+            local bonus = 0
+            if next_w then
+              local w2 = words[ch .. next_w]
+              if w2 and w2 > 500 then bonus = 1.2 end
+            end
+            if bonus == 0 and prev_w then
+              local w1 = words[prev_w .. ch]
+              if w1 and w1 > 500 then bonus = 1.2 end
+            end
+            if bonus > 0 then
+              local sc = lm_char_score(ch, env) + LM_CTX_W * lm_ctx(prev_w, ch, env) + bonus
+              if not best_sc or sc > best_sc + 1e-9
+                 or (math.abs(sc - best_sc) <= 1e-9 and ch < best_ch) then
+                best_sc, best_ch = sc, ch
+              end
+            end
+          end
+        end
+        if best_ch and best_sc > orig_sc + 0.3 then sg.text = best_ch end
+      end
+    end
+    local buf = {}
+    for _, sg in ipairs(res.segs) do buf[#buf + 1] = sg.text end
+    res.text = table.concat(buf)
+  end
+  sentence_cache_key, sentence_cache_val = ck, res
+  return res
+end
+
 local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, full_len)
   -- 防爆上限：超过 MAX_WORD_LEN 的分词不再尝试匹配超长词（词库机构名等长词保留但不在此路径联想）
   if target_len > MAX_WORD_LEN then return end
@@ -1068,24 +1418,6 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   local order = {}
   for w in pairs(found) do order[#order + 1] = found[w] end
 
-  -- 计算 raw_input 中每一段（按 ' 分隔）在整体输入中的字节偏移（0-based，供候选独立提交用）
-local function compute_part_offsets(raw_input)
-  local offsets = {}
-  local pos = 1
-  for p in raw_input:gmatch("[^']+") do
-    local idx = raw_input:find(p, pos, true)
-    if idx then
-      -- Rime Candidate.end 是右开位置；非末段词连同其后的分隔符一起消费，
-      -- 这样点选前段词后，剩余 composition 从下一段笔画开始。
-      local e = idx + #p - 1
-      if raw_input:sub(e + 1, e + 1) == "'" then e = e + 1 end
-      offsets[#offsets + 1] = { start = idx - 1, _end = e }
-      pos = idx + #p + 1
-    end
-  end
-  return offsets
-end
-
   -- 造词等待区词组排序：重复上屏词优先，静态词频次之，原索引顺序兜底。
   local function sort_waiting_phrases(items, env)
     table.sort(items, function(a, b)
@@ -1097,34 +1429,76 @@ end
     end)
   end
 
-  -- 统一候选输出：分词输入优先词库已有词组（整词/前后段词），检索不到词组时才按段序输出全码字，再其余字与完整部件。
-  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end)
-    -- 1. 词库已有整词最优先。
-    if whole_phrases then
-      for _, item in ipairs(whole_phrases) do
-        emit_candidate('phrase', item.text, seg_start, seg_end)
+  -- 统一候选输出：支持「连续输入 / 整句输入」的分层布局。
+  --   ① 整词（覆盖全部段）前几个 —— 一次上屏最多字
+  --   ② 前缀词（覆盖前 k 段，带独立 start/_end）—— 随时可先上屏前面几个字，剩余继续打
+  --   ③ 末段单字（覆盖最后一段）—— 当前正在打的字随时可选；末段码不完整时也有候选，
+  --      绝不会因为「整词池为空」导致该段菜单元为空、预编辑区回退显示原始数字
+  --   ④ 其余整词 / 其余前缀词
+  -- 旧版只输出整词（注释写「保持候选区干净」），整词一多就把前缀词和单字挤到十几页之后，
+  -- 用户既不能提前上屏前段，末段没命中时还会看到数字。
+  local WHOLE_FIRST = 5     -- 首页整词名额
+  local WAITING_FIRST = 2   -- 首页前缀词名额
+  local LAST_CHARS = 4      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
+  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence)
+    local wholes = whole_phrases or {}
+    local waits = waiting_items or {}
+    local n_whole, n_wait = 0, 0
+    for i, item in ipairs(wholes) do
+      if i > WHOLE_FIRST then break end
+      n_whole = i
+      emit_candidate('phrase', item.text, seg_start, seg_end)
+    end
+    -- 整句直出：每段取最优单字拼成整句（词库没有对应整词时也能「整句上屏」）
+    if sentence and sentence ~= '' then
+      emit_candidate('phrase', sentence, seg_start, seg_end)
+    end
+    for i, item in ipairs(waits) do
+      if i > WAITING_FIRST then break end
+      n_wait = i
+      emit_candidate('phrase', item.text, item.s, item.e)
+    end
+    -- 末段单字（码不完整也按前缀出字，保证随时能选字）
+    if #parts >= 1 then
+      local last_off = offsets and offsets[#parts]
+      local ls = last_off and last_off.start or seg_start
+      local le = last_off and last_off._end or seg_end
+      local clist = chars_for(parts[#parts], env)
+      local last_cap = (#wholes == 0) and 8 or LAST_CHARS
+      local n = 0
+      for _, item in ipairs(clist) do
+        if n >= last_cap then break end
+        if not item.component and not item.stroke_symbol then
+          if emit_candidate('single', item.ch, ls, le) then n = n + 1 end
+        end
       end
     end
-    -- 2. 前/后段成型词组（词库已有词组按编码匹配优先）。
-    if waiting_items then
-      for _, item in ipairs(waiting_items) do
-        emit_candidate('phrase', item.text, item.s, item.e)
-      end
+    -- 其余整词
+    for i = n_whole + 1, #wholes do
+      emit_candidate('phrase', wholes[i].text, seg_start, seg_end)
     end
-    -- 3. 候选区纯净：只输出 N+1 字词组候选，不输出每段单字（保持候选区干净）。
+    -- 其余前缀词
+    for i = n_wait + 1, #waits do
+      emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+    end
   end
 
   -- 容错兜底：整词不存在时，启动【造词引擎】，前段成词与后段字词全部按编码优先进入候选区！
   if #order == 0 then
     local offsets = compute_part_offsets(raw_input)
     local added = {}
+    local emitted = 0
     local function add_output(type, cand_text, s, e)
+      if emitted >= MAX_OUTPUT then return false end
       s, e = s or seg.start, e or seg._end
       local key = type .. "\0" .. tostring(s) .. ":" .. tostring(e) .. "\0" .. cand_text
       if not added[key] then
         added[key] = true
+        emitted = emitted + 1
         yield(make_candidate(type, s, e, cand_text, raw_input))
+        return true
       end
+      return false
     end
 
     -- 全码精确字最优先，随后是前/后段成型词组，再是其余候选字与完整部件。
@@ -1157,24 +1531,38 @@ end
       end
       sort_waiting_phrases(waiting, env)
     end
-    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end)
-
-    -- 补充输出末段完整码的精确字（如"补"）：保证 前段词+末段字 都在候选区，
-    -- 也避免 Rime 因末段无候选而把预编辑区显示回原始数字。
-    local last_part = parts[#parts]
-    local last_exact = nil
-    if fuzzy_stroke_on then
-      last_exact = fuzzy_exact_stroke[fuzzy_code(last_part)]
-    else
-      last_exact = exact_stroke[last_part]
-    end
-    if last_exact then
-      for _, ch in ipairs(last_exact) do
-        if not PRIORITY_COMPONENTS[ch] then
-          add_output('single', ch, seg.start, seg._end)
+    -- 整词为空时的候选：前缀词 + 末段单字（emit_all 已包含末段单字，码不完整也出字）
+    local sent2 = decode_sentence(parts, env)
+    local sentence2 = sent2 and sent2.text or nil
+    if not sentence2 and #parts >= 2 and #parts[#parts] >= 2 then
+      local prefix_text = nil
+      for k = #parts - 1, 2, -1 do
+        local sub = {}
+        for i = 1, k do sub[i] = parts[i] end
+        local list = phrase_stroke_index[table.concat(sub, "'")]
+        if list and list[1] then prefix_text = list[1][1] break end
+      end
+      local function best_char2(part)
+        local list = chars_for(part, env)
+        for _, it in ipairs(list) do
+          if not it.component and not it.stroke_symbol then return it.ch end
         end
+        return nil
+      end
+      if prefix_text then
+        local tail = best_char2(parts[#parts])
+        if tail then sentence2 = prefix_text .. tail end
+      else
+        local buf = {}
+        for i, pp in ipairs(parts) do
+          local ch = best_char2(pp)
+          if not ch then buf = nil break end
+          buf[i] = ch
+        end
+        if buf then sentence2 = table.concat(buf) end
       end
     end
+    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2)
 
     -- 3. 无整词时部分回退：保护前段词 + 末段按笔画重新定字（不再整串笔画兜底）
     local has_any = false
@@ -1242,7 +1630,53 @@ end
     end
     sort_waiting_phrases(waiting, env)
   end
-  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end)
+  -- 整句直出候选（「整句输入」的最后一块拼图）：
+  --   优先用句子级 DP 解码（多词组合，如 31'32'45'12 → 「我们吃饭」），
+  --   DP 失败时退化为「前 N-1 段最佳前缀词 + 末段最优字」。
+  local sent = decode_sentence(parts, env)
+  local sentence = sent and sent.text or nil
+  if not sentence and #parts >= 2 and #parts[#parts] >= 2 then
+    local prefix_text, prefix_len = nil, 0
+    for k = #parts - 1, 2, -1 do
+      local sub = {}
+      for i = 1, k do sub[i] = parts[i] end
+      local list = phrase_stroke_index[table.concat(sub, "'")]
+      if list and list[1] then prefix_text = list[1][1] prefix_len = k break end
+    end
+    local function best_char(part)
+      local list = chars_for(part, env)
+      for _, it in ipairs(list) do
+        if not it.component and not it.stroke_symbol then return it.ch end
+      end
+      return nil
+    end
+    if prefix_text then
+      local tail = best_char(parts[#parts])
+      if tail then sentence = prefix_text .. tail end
+    else
+      local buf = {}
+      for i, pp in ipairs(parts) do
+        local ch = best_char(pp)
+        if not ch then buf = nil break end
+        buf[i] = ch
+      end
+      if buf then sentence = table.concat(buf) end
+    end
+  end
+  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence)
+
+  -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
+  if sent and #sent.segs > 1 then
+    local acc = ''
+    for idx, sg in ipairs(sent.segs) do
+      acc = acc .. sg.text
+      if idx < #sent.segs then
+        local st = offsets[sg.from] and offsets[sg.from].start or seg.start
+        local en = offsets[sg.to] and offsets[sg.to]._end or seg._end
+        add_output('phrase', acc, st, en)
+      end
+    end
+  end
 
   -- 终极回退：如果没有任何候选，保护前段词 + 末段按笔画重新定字（不再整串笔画兜底）
   if emitted_count == 0 then
@@ -1250,6 +1684,120 @@ end
   end
 end
 
+
+-- 无分词「整句输入」：把连续笔画码自动切成 2~4 段（每段 1~6 位前缀），
+-- 用词组索引（phrase_stroke_index，键为「每段码 + '」）查词库，得到「我们」「我们的」等多字词。
+-- 这样不打分词键也能出词（整句输入的基础）；词库里没有才退回单字。
+-- 只在「整串不是一个字的完整码」时启用，避免抢完整单字的候选位、也避免无谓开销。
+local auto_word_cache = {}
+local AUTO_WORD_CACHE_MAX = 128
+local function auto_words_for(code, env)
+  local rev = tostring(learning.revision and learning.revision() or 0)
+  local key_all = code .. '\1' .. rev
+  local cached = auto_word_cache[key_all]
+  if cached then return cached end
+  local L = #code
+  local found = {}
+  local parts = {}
+  local states = 0
+  local function dfs(pos, depth)
+    if states > 160 then return end
+    states = states + 1
+    if pos > L then
+      if depth >= 2 then
+        local list = phrase_stroke_index[table.concat(parts, "'")]
+        if list then
+          for i = 1, #list do
+            local w, sf = list[i][1], list[i][2]
+            local old = found[w]
+            if not old or sf > old then found[w] = sf end
+          end
+        end
+      end
+      return
+    end
+    if depth >= 3 then return end
+    local maxlen = math.min(6, L - pos + 1)
+    for len = 1, maxlen do
+      parts[#parts + 1] = code:sub(pos, pos + len - 1)
+      dfs(pos + len, depth + 1)
+      parts[#parts] = nil
+    end
+  end
+  dfs(1, 0)
+  local last = learning.get_last_commit() or ''
+  local arr = {}
+  for w, sf in pairs(found) do
+    arr[#arr + 1] = { w = w, score = (sf or 0) + learning.freq(w, env) * WORD_UF_STEP + ngram.word_freq(last, w, env) }
+  end
+  table.sort(arr, function(a, b)
+    if a.score ~= b.score then return a.score > b.score end
+    return a.w < b.w
+  end)
+  local out = {}
+  for i = 1, math.min(#arr, 6) do out[i] = arr[i].w end
+  auto_word_cache[key_all] = out
+  local n = 0
+  for _ in pairs(auto_word_cache) do n = n + 1 end
+  if n > AUTO_WORD_CACHE_MAX then auto_word_cache = {} end
+  return out
+end
+
+local function emit_auto_words(code, seg, env)
+  if #code < 4 or code:find("?", 1, true) then return 0 end
+  local list = auto_words_for(code, env)
+  for _, w in ipairs(list) do
+    yield(make_candidate('phrase', seg.start, seg._end, w, code))
+  end
+  return #list
+end
+
+-- 连续输入兜底：分词键之后也给出「前几段成型词 + 末段单字」。
+-- 目的：任何时候都能先把已经打好的前几个字上屏，剩余输入继续打（整句输入不中断）。
+local function emit_partial_escape(parts, raw_input, seg, env)
+  if not parts or #parts < 1 then return end
+  local offsets = compute_part_offsets(raw_input)
+  local s = offsets[1] and offsets[1].start or seg.start
+  local e = offsets[#parts] and offsets[#parts]._end or seg._end
+  local seen = {}
+  local function emit_phrase(w)
+    if not w or w == '' or seen[w] then return end
+    seen[w] = true
+    yield(make_candidate('phrase', s, e, w, raw_input))
+  end
+  local key = table.concat(parts, "'")
+  local fast = phrase_stroke_index[key]
+  local n_phrase = 0
+  if fast then
+    for i = 1, math.min(#fast, 3) do
+      emit_phrase(fast[i][1])
+      n_phrase = n_phrase + 1
+    end
+  end
+  if n_phrase == 0 then
+    local hits = slice_phrase_bucket(parts)
+    for i = 1, math.min(#hits, 3) do emit_phrase(hits[i]) end
+  end
+  -- 整句直出：多词组合（如 31'32'45' → 「我们记者」）
+  local sent = decode_sentence(parts, env)
+  if sent and sent.text and sent.text ~= '' then
+    local whole_end = offsets[#parts] and offsets[#parts]._end or seg._end
+    yield(make_candidate('phrase', offsets[1] and offsets[1].start or seg.start, whole_end, sent.text, raw_input))
+  end
+  -- 末段单字：保证「当前这个字」随时可选
+  local lo = offsets[#parts]
+  local ls = lo and lo.start or seg.start
+  local le = lo and lo._end or seg._end
+  local clist = chars_for(parts[#parts], env)
+  local n = 0
+  for _, item in ipairs(clist) do
+    if n >= 6 then break end
+    if not item.component and not item.stroke_symbol then
+      n = n + 1
+      yield(make_candidate('single', ls, le, item.ch, raw_input))
+    end
+  end
+end
 
 -- 处理末尾按下分词键（以 ' 结尾）的通用高频连缀联想（不限字数，字词皆可连）
 -- 场景1: 打出单字笔画后按分词（如 3121' 或 1324454'）-> 联想以“我”或“还”开头的所有高频短语（我们、我的、我想、还是、还有...）
@@ -1342,7 +1890,7 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
       seen_head[head] = true
       local h_len = #head
       local first_ch = utf8_first_char(head)
-      local bucket = head_words[first_ch] or {}
+      local bucket = hw_bucket(first_ch)
       for _, item in ipairs(bucket) do
         local w, sf = item[1], item[2]
         if #w > h_len and w:sub(1, h_len) == head then
@@ -1417,6 +1965,38 @@ end
 local demote_cache = {}
 local demote_cache_time = 0
 local DEMOTE_CACHE_TTL = 2  -- 秒
+-- 联想结果单槽缓存（key 见 build_predict_continuations）
+local predict_cache_key, predict_cache_result = nil, nil
+-- head_words 二级前缀索引：head_words 按首字分桶，像「一」「不」这样的桶内有上千词，
+-- 每次联想都线性扫全桶会让每次按键多几十毫秒。这里按「前两字」惰性建二次索引
+-- （索引项直接引用原桶元素，不复制词频，只建被访问到的首字桶）。
+local head_prefix_index = {}
+local HEAD_PREFIX_INDEX_MAX = 256   -- 最多缓存多少个首字的二级索引（超出整体清空，防止无限增长）
+local function get_head_bucket(last)
+  local first_ch = utf8_first_char(last)
+  local bucket = hw_bucket(first_ch)
+  if not bucket or #bucket == 0 then return nil end
+  if #last <= 3 then return bucket end
+  local idx = head_prefix_index[first_ch]
+  if not idx then
+    idx = {}
+    for _, item in ipairs(bucket) do
+      local w = item[1]
+      if #w >= 6 then
+        local p2 = w:sub(1, 6)
+        local list = idx[p2]
+        if not list then list = {}; idx[p2] = list end
+        list[#list + 1] = item
+      end
+    end
+    local n = 0
+    for _ in pairs(head_prefix_index) do n = n + 1 end
+    if n >= HEAD_PREFIX_INDEX_MAX then head_prefix_index = {} end
+    head_prefix_index[first_ch] = idx
+  end
+  return idx[last:sub(1, 6)] or {}
+end
+
 local function get_demote_set()
   local now = os.time()
   if now - demote_cache_time < DEMOTE_CACHE_TTL then
@@ -1444,6 +2024,26 @@ local function build_predict_continuations(env)
     -- 还没有任何上屏记录时，给出可点的常用起句词，避免候选栏空白
     return {"你好", "我们", "可以", "这个", "什么", "现在", "今天", "没有"}
   end
+  -- 标点上下文：刚上屏「。」「，」等时，ngram 里记的是「标点→下一句首词」。
+  -- learning.get_last_commit 只有纯中文，丢掉标点会让「句号后预测下一句」失效，
+  -- 这里把 ngram 的含标点上下文单独取出来参与 cf 计算（不改变 head_words 组词逻辑）。
+  local punc_ctx = nil
+  if type(ngram.get_last_text) == 'function' then
+    local ok_l, v = pcall(function() return ngram.get_last_text() end)
+    if ok_l and type(v) == 'string' and v ~= '' and v ~= last and #v <= 9 then
+      punc_ctx = v
+    end
+  end
+  -- 联想结果缓存：同一上下文（last/prev2/prev3/标点上下文 + 学习库版本）在多次按键、多个过滤器调用间复用。
+  -- 空输入时每按一次键都会重新跑本函数，而 head_words/学习库遍历是纯只读计算，缓存收益极大。
+  local cache_key = table.concat({
+    last,
+    tostring(learning.get_prev2_commit()),
+    tostring(learning.get_prev3_commit()),
+    tostring(learning.revision and learning.revision() or 0),
+    punc_ctx or '',
+  }, '\1')
+  if predict_cache_key == cache_key then return predict_cache_result end
   local l_len = #last
 
   -- prev2（倒数第二个上屏词）参与上下文加权（FastInput 多词历史思想）：cf = last 的上下文 + prev2 的上下文
@@ -1464,6 +2064,10 @@ local function build_predict_continuations(env)
   }
   local function cf_of(w)
     local base = ngram.word_freq(last, w, env)
+    if punc_ctx then
+      -- 标点后的下一句首词：ngram 记的是「。→明天」这类跨句搭配
+      base = base + ngram.word_freq(punc_ctx, w, env)
+    end
     if prev2_ctx and prev2_ctx ~= last then
       base = base + ngram.word_freq(prev2_ctx, w, env)
     end
@@ -1473,13 +2077,43 @@ local function build_predict_continuations(env)
   end
 
   local found = {}
+  -- 候选来源合并器：同一个词可能被多个来源命中（兜底词/短语联想/离线 bigram/词内补全/末尾组词），
+  -- 旧版各来源直接覆盖 found[w]，后执行的弱来源会把强来源的高分冲掉
+  -- （例：「明天」的短语联想「见」被离线 bigram 第 5 名覆盖，分数从 449000 掉到 296000）。
+  -- 统一改为「取各来源最高 sf」，uf / cf 取最大值。
+  local function put(w, wsf, uf, cfv)
+    if not w or w == '' then return end
+    local old = found[w]
+    if not old then
+      found[w] = { sf = wsf, uf = uf or 0, cf = cfv or 0 }
+      return
+    end
+    if (wsf or 0) > (old.sf or 0) then old.sf = wsf end
+    if (uf or 0) > (old.uf or 0) then old.uf = uf end
+    if (cfv or 0) > (old.cf or 0) then old.cf = cfv end
+  end
+
   -- 任意词上屏后都有可接的通用后接词（数据驱动 unigram 兜底，替代固定虚词）。
   local generic = unigram_fallback
   for i, w in ipairs(generic) do
-    found[w] = {sf = WEIGHTS.sf_generic - i * 100, uf = learning.freq(w, env), cf = cf_of(w)}
+    put(w, WEIGHTS.sf_generic - i * 100, learning.freq(w, env), cf_of(w))
   end
 
-  -- 0. 三连联想（最高优先）：连续上屏两个词后，用离线预训练 trigram 预测第三个词
+  -- 0. 用户三元组（最高优先）：用户真实上屏过的「前两个词 -> 下一个词」。
+  --    例：常打「今天 天气 怎么」后，再次上屏「今天 天气」→ 联想首位就是「怎么」。
+  if prev2_ctx and prev2_ctx ~= last and type(ngram.next_words3) == 'function' then
+    local ok3, list3 = pcall(function() return ngram.next_words3(prev2_ctx, last, env) end)
+    if ok3 and type(list3) == 'table' then
+      for rank, item in ipairs(list3) do
+        local w = item.word
+        if w and w ~= '' and w ~= last then
+          put(w, WEIGHTS.sf_usertri - (rank - 1) * 1000, learning.freq(w, env), cf_of(w))
+        end
+      end
+    end
+  end
+
+  -- 0. 三连联想：连续上屏两个词后，用离线预训练 trigram 预测第三个词
   local prev2 = learning.get_prev2_commit()
   if prev2 and prev2 ~= last then
     local tri_list = next_words_tri[prev2 .. '\t' .. last]
@@ -1489,8 +2123,7 @@ local function build_predict_continuations(env)
     end
     if tri_list then
       for rank, w in ipairs(tri_list) do
-        local uf = learning.freq(w, env)
-        found[w] = {sf = WEIGHTS.sf_tri - (rank * 1000), uf = uf, cf = cf_of(w)}
+        put(w, WEIGHTS.sf_tri - (rank * 1000), learning.freq(w, env), cf_of(w))
       end
     end
   end
@@ -1501,8 +2134,7 @@ local function build_predict_continuations(env)
     local quad_list = phrase_assoc_quad[prev3 .. '\t' .. prev2 .. '\t' .. last]
     if quad_list then
       for rank, w in ipairs(quad_list) do
-        local uf = learning.freq(w, env)
-        found[w] = {sf = WEIGHTS.sf_quad - (rank * 1000), uf = uf, cf = cf_of(w)}
+        put(w, WEIGHTS.sf_quad - (rank * 1000), learning.freq(w, env), cf_of(w))
       end
     end
   end
@@ -1511,8 +2143,7 @@ local function build_predict_continuations(env)
   local assoc_list = phrase_assoc[last]
   if assoc_list then
     for rank, w in ipairs(assoc_list) do
-      local uf = learning.freq(w, env)
-      found[w] = {sf = WEIGHTS.sf_assoc - (rank * 1000), uf = uf, cf = cf_of(w)}
+      put(w, WEIGHTS.sf_assoc - (rank * 1000), learning.freq(w, env), cf_of(w))
     end
   end
 
@@ -1520,54 +2151,53 @@ local function build_predict_continuations(env)
   local nxt_list = next_words_big[last] or next_words[last]
   if nxt_list then
     for rank, w in ipairs(nxt_list) do
-      local uf = learning.freq(w, env)
-      found[w] = {sf = WEIGHTS.sf_bigram - (rank * 1000), uf = uf, cf = cf_of(w)}
+      put(w, WEIGHTS.sf_bigram - (rank * 1000), learning.freq(w, env), cf_of(w))
     end
   end
 
   -- 1.1 用户 bigram 直出（路线A/C）：用户历史中 last->X 的后接词直接作为候选。
   --     即使 X 不在静态联想表（如「句号 -> 下一句首词」）也能被预测；
   --     权重略高于静态 bigram（sf_bigram+50000），低于三连/短语联想。
+  --     结果在同一轮内复用（下方循环抑制还要再查一次）。
+  local user_next = {}
   if last and last ~= '' and type(ngram.next_words) == 'function' then
     local ok_uw, user_list = pcall(function() return ngram.next_words(last, env) end)
-    if ok_uw and type(user_list) == 'table' then
-      for rank, item in ipairs(user_list) do
-        local w = item.word
-        if w and w ~= '' and not found[w] then
-          found[w] = {
-            sf = WEIGHTS.sf_bigram + 50000 - (rank - 1) * 1000,
-            uf = learning.freq(w, env),
-            cf = cf_of(w),
-          }
-        end
+    if ok_uw and type(user_list) == 'table' then user_next = user_list end
+  end
+  if #user_next > 0 then
+    for rank, item in ipairs(user_next) do
+      local w = item.word
+      if w and w ~= '' then
+        put(w, WEIGHTS.sf_bigram + 50000 - (rank - 1) * 1000, learning.freq(w, env), cf_of(w))
       end
     end
   end
 
   -- 2. 从 head_words 中截取后缀作为词内补全候选
+  --    （限制匹配数：单字 last（如「我」）时桶内数百词全命中，会撑爆候选池导致 gram 计算+排序卡顿；
+  --     桶按词频排序，取前 30 个高频后缀已覆盖绝大多数常用联想）
   local first_ch = utf8_first_char(last)
-  local bucket = head_words[first_ch] or {}
+  local bucket = get_head_bucket(last) or {}
+  local head_hits = 0
   for _, item in ipairs(bucket) do
     local w, sf = item[1], item[2]
     if #w > l_len and w:sub(1, l_len) == last then
+      head_hits = head_hits + 1
+      if head_hits > HEAD_WORDS_MAX then break end
       local suffix = w:sub(l_len + 1)
-      local uf = learning.freq(suffix, env)
-      local old = found[suffix]
-      if not old or sf > old.sf or uf > (old.uf or 0) then
-        found[suffix] = {sf = sf, uf = uf, cf = cf_of(suffix)}
-      end
+      put(suffix, sf, learning.freq(suffix, env), cf_of(suffix))
     end
   end
 
-  -- 3. 在用户学习库中寻找
+  -- 3. 在用户学习库中寻找（同样限制匹配数，用户词库膨胀后仍保持候选池可控）
+  local learn_hits = 0
   for w, uf in pairs(learning.all(env)) do
     if #w > l_len and w:sub(1, l_len) == last then
+      learn_hits = learn_hits + 1
+      -- 不在遍历中截断：pairs 顺序不稳定，截断会让候选集在两次启动间抖动
+      if learn_hits > LEARN_MAX * 10 then break end
       local suffix = w:sub(l_len + 1)
-      local sf = words[suffix] or 0
-      local old = found[suffix]
-      if not old or uf > (old.uf or 0) then
-        found[suffix] = {sf = sf, uf = uf, cf = cf_of(suffix)}
-      end
+      put(suffix, words[suffix] or 0, uf, cf_of(suffix))
     end
   end
 
@@ -1581,10 +2211,7 @@ local function build_predict_continuations(env)
         if #w == 6 then
           local second = w:sub(4, 6)
           local wf = words[w] or 0
-          local old = found[second]
-          if not old or (WEIGHTS.sf_tailword + wf) > (old.sf or 0) then
-            found[second] = {sf = WEIGHTS.sf_tailword + wf, uf = learning.freq(second, env), cf = cf_of(second)}
-          end
+          put(second, WEIGHTS.sf_tailword + wf, learning.freq(second, env), cf_of(second))
         end
       end
     end
@@ -1600,13 +2227,8 @@ local function build_predict_continuations(env)
     recent_set[recent[i]] = true
   end
   local strong_set = {}
-  if last and last ~= '' and type(ngram.next_words) == 'function' then
-    local ok_uw, user_list = pcall(function() return ngram.next_words(last, env) end)
-    if ok_uw and type(user_list) == 'table' then
-      for _, item in ipairs(user_list) do
-        strong_set[item.word] = true
-      end
-    end
+  for _, item in ipairs(user_next) do
+    strong_set[item.word] = true
   end
   for s in pairs(found) do
     if recent_set[s] and not strong_set[s] then
@@ -1627,25 +2249,96 @@ local function build_predict_continuations(env)
     end
     return 0
   end
+  -- 语言模型分（借鉴 Rime::Grammar / wanxiang-lts-zh-hans.gram）：
+  -- 根据「上下文 last + 候选词」的 n-gram 搭配合理性加分，让联想更自然。
+  -- 配置由 load_settings 惰性加载一次（避免每次联想重复读 schema / configure）。
+  local gram_enable = GRAM_ENABLE
+  local gram_weight = GRAM_WEIGHT
+  local ok_gm = gram_model_ok
+  local gram_model = gram_model_ref
+  local function gram_score(w)
+    if not gram_enable or not ok_gm then return 0 end
+    return gram_model.query(last, w) * gram_weight
+  end
+  -- 两阶段排序（性能优化）：
+  -- 1) 粗排（sf + uf + cf − penalty，不含语言模型分）把候选池缩小到前 PRE_RANK，
+  --    避免单字 last 时数百候选全部做 gram_model 查询（每次查 4 张大表）造成卡顿；
+  -- 2) 只对粗排前列候选计算语言模型分，再精排取前 PREDICT_MAX 个。
+  -- 排序主键 = 静态语料分 sf + 用户个性化 uf*UF_STEP + 上下文分 cf - 惩罚。
+  -- 旧版主键只有 uf*step + cf，sf 仅作 tie-break：结果离线 bigram / 三连 / 短语联想几乎不生效，
+  -- 候选实际由「用户频率 + 衔接词固定加分」决定（例：「明天」后推「好」而不是「见」）。
+  local function base_score(w)
+    local it = found[w]
+    return (it.sf or 0) + it.uf * UF_STEP + (it.cf or 0) - penalty_of(w)
+  end
   table.sort(order, function(a, b)
-    local item_a, item_b = found[a], found[b]
-    local au = item_a.uf * UF_STEP + (item_a.cf or 0) - penalty_of(a)
-    local bu = item_b.uf * UF_STEP + (item_b.cf or 0) - penalty_of(b)
+    local au, bu = base_score(a), base_score(b)
     if au ~= bu then return au > bu end
-    if item_a.sf ~= item_b.sf then return item_a.sf > item_b.sf end
+    return a < b
+  end)
+  local pre_ranked = {}
+  for i = 1, math.min(#order, PRE_RANK) do
+    pre_ranked[i] = order[i]
+  end
+  order = pre_ranked
+
+  local gram_scores = {}
+  if gram_enable and ok_gm then
+    for _, w in ipairs(order) do
+      gram_scores[w] = gram_model.query(last, w) * gram_weight
+    end
+  end
+  table.sort(order, function(a, b)
+    local au = base_score(a) + (gram_scores[a] or 0)
+    local bu = base_score(b) + (gram_scores[b] or 0)
+    if au ~= bu then return au > bu end
     return a < b
   end)
 
   -- 降权词排除：联想候选不输出 demote.user.tsv 中的词
+  -- 部首排除：偏旁部首单字不作为联想候选输出
+  -- 自我重复排除：候选与上一个上屏词相同（如「开心 → 开心」）不输出
+  -- 可输入排除：含无笔画码字符（标点/emoji/生僻字）的词不作为联想候选——
+  -- 用户点选后无法继续用笔画输入，属于无效联想（例：刚上屏「明天」后 ngram 学到「明天→。」）
+  local function is_typeable(w)
+    for ch in w:gmatch("[\1-\127\194-\244][\128-\191]*") do
+      if not stroke[ch] then return false end
+    end
+    return true
+  end
   local demoted = get_demote_set()
   local out = {}
+  local first_count = {}
+  local function ok_cand(w)
+    return w ~= last and not demoted[w] and not is_component_char(w) and is_typeable(w)
+  end
+  -- 第一遍：同首字最多 2 个（避免「我们的/我们这/我们不…」刷屏，联想更有多样性）
   for i = 1, #order do
-    if #out >= 5 then break end
+    if #out >= PREDICT_MAX then break end
     local w = order[i]
-    if not demoted[w] then
-      out[#out + 1] = w
+    if ok_cand(w) then
+      local fc = utf8_first_char(w) or w
+      local c = first_count[fc] or 0
+      if c < 2 then
+        first_count[fc] = c + 1
+        out[#out + 1] = w
+      end
     end
   end
+  -- 第二遍：名额没满时再按分数补（不限首字）
+  if #out < PREDICT_MAX then
+    local got = {}
+    for _, w in ipairs(out) do got[w] = true end
+    for i = 1, #order do
+      if #out >= PREDICT_MAX then break end
+      local w = order[i]
+      if not got[w] and ok_cand(w) then
+        got[w] = true
+        out[#out + 1] = w
+      end
+    end
+  end
+  predict_cache_key, predict_cache_result = cache_key, out
   return out
 end
 
@@ -1656,7 +2349,23 @@ local function emit_predict_continuation(seg, env)
   end
 end
 
-local function translator(input, seg, env)
+-- 诊断日志（仅在 segment_phrase/debug_input: true 时写）：
+-- 记录「翻译器收到的 input / ctx.input / 段范围」以及本次产出的候选数，
+-- 用来确认「预编辑显示两个字符」到底是输入串本身重复，还是候选 preedit 没生效。
+local function debug_input_log(env, tag, input, seg, n_cand)
+  if not DEBUG_INPUT then return end
+  local d = (rime_api and rime_api.get_user_data_dir and rime_api:get_user_data_dir()) or '.'
+  local f = io.open(d .. '/bg5_input.log', 'a')
+  if not f then return end
+  local ctx_input = ''
+  pcall(function() ctx_input = env.engine.context.input or '' end)
+  f:write(string.format('%s\t%s\tin=[%s]\tctx=[%s]\tseg=[%s,%s]\tn=%s\n',
+    os.date('%H:%M:%S'), tag, tostring(input), tostring(ctx_input),
+    tostring(seg and seg.start), tostring(seg and seg._end), tostring(n_cand)))
+  f:close()
+end
+
+local function translator_body(input, seg, env)
   if not seg or seg.start == nil or seg._end == nil then return end
   if input and input:sub(1, 1) == 'V' then return end
   -- 纯字母输入（拼音反查）：交给 pinyin_reverse translator，本翻译器不输出笔画符号兜底
@@ -1693,6 +2402,33 @@ local function translator(input, seg, env)
   -- 必须放在任何提前 return 分支（降权/下移等功能键）之前，
   -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
   force_preedit(env, input)
+
+  -- 多段 composition 兼容（关键）：
+  -- librime 的 TranslateSegments 对每个段单独调用 translator，传入的 input 是
+  -- 「该段子串」而不是整串（seg.start/_end 仍是整串坐标）。
+  -- 此时整串分词解析（emit_phrase_with_parts / emit_open_continuation）会算错词长，
+  -- 甚至一个候选都不产出 → 该段菜单元为空 → 元书把未翻译的编码原样显示成数字。
+  -- 处理：段子串（起点>0 或不是整串前缀）一律按「单段」处理，保证每段都有候选。
+  local seg_local = false
+  do
+    local ctx0 = env.engine and env.engine.context
+    local full0 = ctx0 and ctx0.input or nil
+    if type(full0) == 'string' and #full0 > #input and input ~= full0 then
+      local st0 = tonumber(seg.start) or 0
+      if st0 > 0 or full0:sub(1, #input) ~= input then
+        seg_local = true
+      end
+    end
+  end
+  if seg_local then
+    local core = input:gsub("^'+", ""):gsub("'+$", "")
+    if core ~= '' and core:match("^[12345?]+$") then
+      emit_single(core, seg, env)
+    else
+      yield(make_candidate('stroke_fallback', seg.start, seg._end, to_stroke_symbol(input), input))
+    end
+    return
+  end
 
   -- 纯问号输入：符号键盘的问号（元书以半角 ? 键码发送）按标点输出全角 ？，
   -- 不作为通配符；笔画码中的 ?（如 31?）仍走通配逻辑。
@@ -1734,43 +2470,89 @@ local function translator(input, seg, env)
     return
   end
 
+  -- 解析用输入：去掉「前导分词符」。前一个段上屏后，Rime 可能把残余输入变成
+  -- 以 ' 开头的段（如 "'45"），若不剥离，会多算一个分词符（按 2 字词过滤），
+  -- 候选变少甚至为空。尾部 ' 保留（表示刚按了分词键）。
+  -- 注意：raw_input（候选偏移/preedit 用）仍用原串。
+  local parse_input = input:gsub("^'+", "")
+  if parse_input == '' then parse_input = input end
+
   -- 情况 A: 刚按下分词符，末尾是 ' (例如 3121' 或 1324454' 或 31'32')
   -- 立即触发高频连缀联想（不限字数，字词皆通）
-  if input:sub(-1, -1) == "'" then
-    local prefix_expr = input:sub(1, -2)
+  if parse_input:sub(-1, -1) == "'" then
+    local prefix_expr = parse_input:sub(1, -2)
     if prefix_expr ~= "" and not prefix_expr:find("''", 1, true) then
       emit_open_continuation(prefix_expr, input, seg, env)
+      -- 追加「前段词 + 末段单字」：连打/整句输入时可以随时先上屏前几个字
+      local p_parts = {}
+      for p in prefix_expr:gmatch("[^']+") do
+        if p:match("^[12345?]+$") then p_parts[#p_parts + 1] = p end
+      end
+      emit_partial_escape(p_parts, input, seg, env)
       return
     end
   end
 
   -- 统计分词符数量
   local seg_count = 0
-  for _ in input:gmatch("'") do seg_count = seg_count + 1 end
+  for _ in parse_input:gmatch("'") do seg_count = seg_count + 1 end
 
   if seg_count > 0 then
     -- 点 1 次分词：锁定 2 字词；点 2 次分词：锁定 3 字词；以此类推
     local target_len = seg_count + 1
     local parts = {}
-    for p in input:gmatch("[^']+") do
+    for p in parse_input:gmatch("[^']+") do
       if p:match("^[12345?]+$") then
         parts[#parts + 1] = p
       end
     end
 
+    -- 简码精确命中：如输入 1'1（每字首笔 + 分词符）→ 或者/现在/需要，置顶
+    if quick_codes then
+      local qc_key = table.concat(parts, "'")
+      local qc = quick_codes[qc_key]
+      if qc then
+        for _, w in ipairs(qc) do
+          yield(make_candidate('phrase', seg.start, seg._end, w, input))
+        end
+      end
+    end
+
     if #parts == target_len then
-      emit_phrase_with_parts(parts, target_len, input, seg, env)
+      if target_len > MAX_WORD_LEN then
+        -- 超过词长上限的整句输入：仍然给出「前段词 + 末段单字」，保证可连续输入
+        emit_partial_escape(parts, input, seg, env)
+      else
+        emit_phrase_with_parts(parts, target_len, input, seg, env)
+      end
       return
     end
     -- 若分段数量暂未完全对齐（例如刚按了分词键），优先输出第一段的匹配结果兜底
     if #parts >= 1 then
-      emit_phrase_with_parts(parts, #parts, input, seg, env)
+      if #parts > MAX_WORD_LEN then
+        emit_partial_escape(parts, input, seg, env)
+      else
+        emit_phrase_with_parts(parts, #parts, input, seg, env)
+      end
       return
     end
   else
     -- 无分词输入：只预测单字候选（不输出二字/三字/四字词，保持候选区干净）
-    if input:match("^[12345?]+$") then
-      emit_single(input, seg, env)
+    -- 前一个段上屏后 Rime 可能把残余输入变成以 ' 开头的段（如 "'45"），
+    -- 这里用去掉首尾分词符的副本判断，raw_input 仍用原串以保证候选偏移正确。
+    local core = parse_input:gsub("'+$", "")
+    if core:match("^[12345?]+$") then
+      -- 整句输入：连续码自动组词（不打分词符也能出「我们」这类词）
+      local has_exact = exact_stroke[core] and #exact_stroke[core] > 0
+      if has_exact then
+        -- 整串恰好是某个字的完整码：单字优先，词随后
+        emit_single(core, seg, env)
+        emit_auto_words(core, seg, env)
+      else
+        -- 整串不是一个字：自动组词优先（这才是「整句输入」想要的结果）
+        emit_auto_words(core, seg, env)
+        emit_single(core, seg, env)
+      end
       return
     end
   end
@@ -1780,12 +2562,31 @@ local function translator(input, seg, env)
   yield(make_candidate('single', seg.start, seg._end, safe_sym, input))
 end
 
+-- 兜底包装：任何 Lua 异常都不能让当前段的菜单变空。
+-- 菜单为空的段，Rime 会用原始编码渲染预编辑区（数字），这也是「某个字后面出现数字」的常见成因。
+local function translator(input, seg, env)
+  local n = 0
+  local orig_yield = yield
+  -- 计数包装（仅为了诊断日志；yield 是 librime-lua 注入的全局函数）
+  yield = function(c) n = n + 1; orig_yield(c) end
+  local ok, err = pcall(translator_body, input, seg, env)
+  yield = orig_yield
+  if not ok and seg and seg.start ~= nil and seg._end ~= nil then
+    pcall(function()
+      yield(make_candidate('stroke_fallback', seg.start, seg._end, to_stroke_symbol(input or ''), input or ''))
+      n = n + 1
+    end)
+  end
+  debug_input_log(env, ok and 'ok' or ('ERR:' .. tostring(err)), input, seg, n)
+end
+
 -- 返回表：librime-lua 的 lua_translator 调用表的 func 字段；
 -- 同时导出联想候选生成函数，供 predict_space（空格连打）等模块复用。
 -- 可选参数 last_override：外部传入的预测上下文（可含标点，如「。」），
 -- 用于路线A（连打 fallback 的句号后预测）；不传则行为与旧版完全一致。
 M.func = translator
 M.get_predict_continuations = function(env, last_override)
+  load_settings(env)
   if last_override and last_override ~= '' then
     local saved = learning.get_last_commit()
     learning.set_last_commit(last_override)
@@ -1803,6 +2604,7 @@ end
 -- 供 auto_commit 处理器判断：即使候选不唯一，首位置信度 >= 阈值也可自动上屏。
 -- 非完整码/无精确候选/总权重为 0 时返回 nil（不触发）。
 M.get_auto_select_first = function(input, env)
+  load_settings(env)
   if not input or input == '' then return nil end
   if not input:match("^[12345]+$") then return nil end
   local chars = chars_for(input, env)
