@@ -158,6 +158,11 @@ predictor:
   max_candidates: 6
   max_iterations: 10
 
+# 学习库容量管理（词条数无限增长会导致启动加载变慢、联想遍历变慢）
+learning:
+  max_entries: 30000   # 词条数上限；超出按「频次低 + 久未用」淘汰
+  prune_days: 180      # 频次 <= 1 且超过 N 天未用的词条直接清理
+
 # 轻量级 n-gram 上下文联想（基于上屏词对学习，提升连续输入时候选精准度）
 ngram:
   enable: true          # 总开关

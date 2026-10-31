@@ -691,6 +691,12 @@ local function utf8_first_char(s)
 end
 
 local preedit_util = require('preedit_util')
+-- 码内候选偏好（长码下用户常选哪个候选）
+local pos_memory = nil
+do
+  local ok, m = pcall(require, 'pos_memory')
+  if ok and type(m) == 'table' then pos_memory = m end
+end
 local function to_stroke_symbol(s) return preedit_util.to_stroke_symbol(s) end
 local function force_preedit(env, inpt) preedit_util.set_preedit(env, inpt) end
 
@@ -835,6 +841,10 @@ local function chars_for(seg, env)
   end
 
   local last = learning.get_last_commit() or ''
+  -- 码内偏好分预计算（避免排序比较里反复查表）
+  if pos_memory and #seg >= 3 then
+    for _, item in ipairs(out) do item._pm = pos_memory.score(seg, item.ch) or 0 end
+  end
   -- 首两笔选字优化：短码（<=2笔）时不把精确命中字无条件顶格，
   -- 而是按「学习频次 + 上下文 + 静态字频」综合排序，让高频字（都/要/下…）直接进候选。
   local short_code = #seg <= 2
@@ -849,7 +859,11 @@ local function chars_for(seg, env)
       local sb = bf * CHAR_UF_STEP + bcf + (char_freq[b.ch] or 0)
       if sa ~= sb then return sa > sb end
     else
-      if af * CHAR_UF_STEP + acf ~= bf * CHAR_UF_STEP + bcf then return af * CHAR_UF_STEP + acf > bf * CHAR_UF_STEP + bcf end
+      local ab = af * CHAR_UF_STEP + acf
+      local bb = bf * CHAR_UF_STEP + bcf
+      ab = ab + (a._pm or 0)
+      bb = bb + (b._pm or 0)
+      if ab ~= bb then return ab > bb end
     end
     -- 完整部件只在完整编码后出现；普通字与学习频次先参与排序。
     if a.rank ~= b.rank then return a.rank < b.rank end
@@ -2576,6 +2590,7 @@ local function translator_body(input, seg, env)
   -- 必须放在任何提前 return 分支（降权/下移等功能键）之前，
   -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
   force_preedit(env, input)
+  if pos_memory and input and input ~= '' then pos_memory.set_code(input) end
 
   -- 多段 composition 兼容（关键）：
   -- librime 的 TranslateSegments 对每个段单独调用 translator，传入的 input 是

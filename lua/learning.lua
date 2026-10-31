@@ -12,6 +12,18 @@
 --    高频保护下限 MIN_FREQ 同步降低，与上限匹配（衰减到下限即停止）。
 
 local M = {}
+
+-- 码内候选偏好（可选模块）：懒加载一次，避免每次 commit 都 require
+local pos_memory = nil
+local pos_memory_checked = false
+local function pm()
+  if not pos_memory_checked then
+    pos_memory_checked = true
+    local ok, m = pcall(require, 'pos_memory')
+    if ok and type(m) == 'table' then pos_memory = m end
+  end
+  return pos_memory
+end
 local loaded = false
 local data = {}             -- 文字/词组 -> { cnt=累计上屏频次, last=最后上屏时间戳 }（唯一持久化数据源）
 local learned = {}          -- 所有学习到的多字词组 -> 频次
@@ -26,6 +38,11 @@ local DECAY_MIN_ELAPSED = 86400   -- 至少间隔 1 天（86400 秒）才执行�
 local MIN_FREQ = 8          -- 衰减下限：上屏频次达到该值的词，衰减到此即停止（高频词保护）
 local MAX_UF = 10           -- 用户词频上限：单条用户词累计频次封顶，防止霸榜（极端保护）
 local last_decay_time = 0
+-- 词库容量管理（v13）：长期使用后 data 会无限增长，影响启动加载与联想遍历。
+--   MAX_ENTRIES      ：词条数上限，超出按「频次低 + 久未用」淘汰
+--   PRUNE_STALE_DAYS ：频次为 1 且超过 N 天未用的词条，直接清理
+local MAX_ENTRIES = 30000
+local PRUNE_STALE_DAYS = 180
 
 -- 降权词集合（demote.user.tsv）：被手动降权的词不再被学习（对标讯飞 UserWordDelManager，
 -- 防止「删了又学」）。带 TTL 缓存，取消降权后最多 DEMOTE_TTL 秒内重新生效。
@@ -121,57 +138,73 @@ end
 local function apply_decay(force)
   local now = os.time()
   if not force and (now - last_decay_time) < DECAY_MIN_ELAPSED then return end
+  local since = last_decay_time
   last_decay_time = now
   local changed = false
   for w, item in pairs(data) do
-    local elapsed = now - item.last
-    if elapsed > DECAY_MIN_ELAPSED then
-      -- 半衰期衰减：factor = 0.5^(elapsed/(HALF_LIFE_DAYS*86400))
+    -- 只衰减「上次衰减之后」的增量：
+    --   期间用过 → 从最后使用时间算（衰减很少）
+    --   一直没用 → 只算本次间隔（避免多次启动重复衰减）
+    local base = item.last
+    if since > base then base = since end
+    local elapsed = now - base
+    if elapsed > 0 then
       local factor = 0.5 ^ (elapsed / (HALF_LIFE_DAYS * 86400))
       local new_cnt = math.floor(item.cnt * factor + 0.5)
       if item.cnt >= MIN_FREQ and new_cnt < MIN_FREQ then
-        -- 高频词保护：衰减到下限即停止，避免高频词被遗忘到不可见
-        item.cnt = MIN_FREQ
+        item.cnt = MIN_FREQ   -- 高频词保护
       elseif new_cnt < 1 then
-        data[w] = nil   -- 低频词遗忘：权重归零，彻底移除
+        data[w] = nil         -- 低频词遗忘
       else
         item.cnt = new_cnt
       end
-      item.last = now -- 衰减后重置计时，避免重复衰减
+      -- 注意：不修改 item.last（它记录的是「最后一次上屏时间」，是衰减基准，不能重置）
       changed = true
     end
   end
   if changed then
     rebuild_indexes()
   end
+  return changed
 end
 
-local function load(env)
-  if loaded then return end
-  loaded = true
-  local d = user_dir()
-  path = d .. '/bg5-learning.user.tsv'
-
+-- 容量管理：删除长期未用的低频词条；超限时按「频次低 + 久未用」淘汰
+local function prune_entries()
   local now = os.time()
-  local f = io.open(path, 'r')
-  if f then
-    for line in f:lines() do
-      local w, n, ts = line:match('^([^\t]+)\t(%d+)\t(%d+)$')
-      if w then
-        data[w] = { cnt = tonumber(n), last = tonumber(ts) }
-      else
-        -- 兼容旧格式：只有 词+频次，没有时间戳，视为“刚使用过”，不立即衰减
-        local w2, n2 = line:match('^([^\t]+)\t(%d+)$')
-        if w2 then
-          data[w2] = { cnt = tonumber(n2), last = now }
-        end
-      end
+  local removed = 0
+  local stale = PRUNE_STALE_DAYS * 86400
+  for w, item in pairs(data) do
+    if item.cnt <= 1 and (now - item.last) > stale then
+      data[w] = nil
+      removed = removed + 1
     end
-    f:close()
   end
-  -- 加载后执行一次衰减清理
-  apply_decay(true)
-  rebuild_indexes()
+  local n = 0
+  for _ in pairs(data) do n = n + 1 end
+  if n > MAX_ENTRIES then
+    local arr = {}
+    for w, item in pairs(data) do
+      arr[#arr + 1] = { w = w, cnt = item.cnt, last = item.last }
+    end
+    table.sort(arr, function(a, b)
+      if a.cnt ~= b.cnt then return a.cnt < b.cnt end
+      return a.last < b.last
+    end)
+    for i = 1, n - MAX_ENTRIES do
+      data[arr[i].w] = nil
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+local function load_config(env)
+  local cfg = env and env.engine and env.engine.schema and env.engine.schema.config
+  if not cfg then return end
+  local v = cfg:get_int('learning/max_entries')
+  if v and v > 0 then MAX_ENTRIES = v end
+  local d = cfg:get_int('learning/prune_days')
+  if d and d > 0 then PRUNE_STALE_DAYS = d end
 end
 
 local function safe_save_file(p, table_data)
@@ -180,6 +213,7 @@ local function safe_save_file(p, table_data)
   local f = nil
   local ok, err = pcall(function()
     f = assert(io.open(tmp, 'w'))
+    f:write('#\t', tostring(last_decay_time or 0), '\n')
     for w, item in pairs(table_data) do
       f:write(w, '\t', tostring(item.cnt), '\t', tostring(item.last), '\n')
     end
@@ -196,12 +230,64 @@ local function safe_save_file(p, table_data)
   end
 end
 
+local function load(env)
+  if loaded then return end
+  loaded = true
+  load_config(env)
+  local d = user_dir()
+  path = d .. '/bg5-learning.user.tsv'
+
+  local now = os.time()
+  local f = io.open(path, 'r')
+  if f then
+    local first = true
+    for line in f:lines() do
+      -- 文件头：#\t<上次衰减时间戳>（用于「增量衰减」，避免多次启动重复衰减）
+      if first then
+        first = false
+        local dts = line:match('^#\t(%d+)$')
+        if dts then
+          last_decay_time = tonumber(dts)
+        else
+          -- 没有文件头（旧格式）：走下面的正常解析
+        end
+        if dts then goto continue end
+      end
+      local w, n, ts = line:match('^([^\t]+)\t(%d+)\t(%d+)$')
+      if w then
+        data[w] = { cnt = tonumber(n), last = tonumber(ts) }
+      else
+        -- 兼容旧格式：只有 词+频次，没有时间戳，视为“刚使用过”，不立即衰减
+        local w2, n2 = line:match('^([^\t]+)\t(%d+)$')
+        if w2 then
+          data[w2] = { cnt = tonumber(n2), last = now }
+        end
+      end
+      ::continue::
+    end
+    f:close()
+  end
+  -- 加载后：先按时间衰减，再按容量规则清理
+  local changed = apply_decay(true)
+  local removed = prune_entries()
+  rebuild_indexes()
+  -- 有变化时立即落盘：把「上次衰减时间」写进文件头，
+  -- 否则进程退出后内存丢失，下次启动会按同一段时间再衰减一次（重复衰减）。
+  if changed or removed > 0 then
+    safe_save_file(path, data)
+  end
+end
+
+
 -- 合并落盘：每次上屏只累加计数器，达到间隔才写文件（数据源只有 data 一个表）
 local function save()
   if path then
     apply_decay(false)
     safe_save_file(path, data)
   end
+  -- 顺带落盘「码内候选偏好」（同一节奏，避免它一直留在内存里）
+  local m = pm()
+  if m and type(m.flush) == 'function' then pcall(m.flush) end
 end
 
 function M.freq(w, env)
@@ -428,6 +514,11 @@ function M.attach(env)
   if env._bg5_learning_connected then return true end
   local function on_commit(ctx)
     local text = ctx:get_commit_text() or ''
+    -- 码内候选偏好：记录「这个码下选了哪个候选」
+    if text ~= '' then
+      local m = pm()
+      if m then pcall(m.on_commit, text) end
+    end
     if text ~= '' and chinese_only(text) then
       -- 连续上屏组合造词：上一次上屏 + 本次上屏 = 新造词（若组合仍为纯中文）
       if prev_commit and prev_commit ~= text then
