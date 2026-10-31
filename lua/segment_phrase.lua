@@ -114,6 +114,8 @@ local CHAR_UF_STEP = WEIGHTS.char_uf_step
 local HEAD_WORDS_MAX = 30
 local LEARN_MAX = 20
 local PRE_RANK = 60
+local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
+local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
 local PREDICT_MAX = 8       -- 空输入联想候选数（menu/page_size 一页 9 个，留 1 位给 predict_next 混合候选）
 local GRAM_ENABLE = false
 local GRAM_WEIGHT = 60000
@@ -146,6 +148,10 @@ local function load_settings(env)
     if bm ~= nil then BEAM_ENABLE = bm end
     local dbg = cfg:get_bool('segment_phrase/debug_input')
     if dbg ~= nil then DEBUG_INPUT = dbg end
+    local shf = cfg:get_int('segment_phrase/short_head_freeze')
+    if shf and shf >= 0 then SHORT_HEAD_FREEZE = shf end
+    local sub = cfg:get_int('segment_phrase/short_uf_boost')
+    if sub and sub > 0 then SHORT_UF_BOOST = sub end
     local pm = cfg:get_int('segment_phrase/predict_max')
     if pm and pm > 0 then PREDICT_MAX = pm end
     local h = cfg:get_int('segment_phrase/head_words_max')
@@ -849,6 +855,22 @@ local function chars_for(seg, env)
     if a.rank ~= b.rank then return a.rank < b.rank end
     return a.ch < b.ch
   end)
+
+  -- 短码个性化（③）：前 SHORT_HEAD_FREEZE 位保持上面算出的静态顺序（《首两笔速查》），
+  -- 从下一位起按「用户上屏频次」提权重排。没有用户数据时结果与原顺序完全一致。
+  if short_code and SHORT_HEAD_FREEZE < #out then
+    local frozen = SHORT_HEAD_FREEZE
+    local rest = {}
+    for i = frozen + 1, #out do rest[#rest + 1] = out[i] end
+    table.sort(rest, function(a, b)
+      if a.component ~= b.component then return not a.component end
+      local au = learning.freq(a.ch, env) * SHORT_UF_BOOST + (char_freq[a.ch] or 0)
+      local bu = learning.freq(b.ch, env) * SHORT_UF_BOOST + (char_freq[b.ch] or 0)
+      if au ~= bu then return au > bu end
+      return a.ch < b.ch
+    end)
+    for i, item in ipairs(rest) do out[frozen + i] = item end
+  end
 
   cache[env][seg] = out
   return out
