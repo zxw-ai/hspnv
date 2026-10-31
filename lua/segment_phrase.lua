@@ -1529,14 +1529,20 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
         emit_candidate('phrase', sentence .. '。', seg_start, seg_end)
       end
     end
+    -- 非置顶时，整句固定插在第 2 个整词之后（首页第 3 位），
+    -- 避免被 5 个整词挤到首页末尾/第二页
+    local insert_at = (not last_complete or not sent_ok) and 2 or nil
     for i, item in ipairs(wholes) do
       if i > WHOLE_FIRST then break end
       n_whole = i
       emit_candidate('phrase', item.text, seg_start, seg_end)
+      if insert_at and i == insert_at and sentence and sentence ~= '' then
+        emit_candidate('phrase', sentence, seg_start, seg_end)
+      end
     end
-    -- 整句直出：每段取最优单字拼成整句（词库没有对应整词时也能「整句上屏」）
-    -- 末段完整时时已在最前面输出过，这里不重复
-    if sentence and sentence ~= '' and not last_complete then
+    -- 整句直出：已在前两处输出过（置顶 或 第 2 个整词之后），这里不重复。
+    -- 仅当首页整词不足 2 个（无法插入）时兜底输出。
+    if sentence and sentence ~= '' and not last_complete and n_whole < 2 then
       emit_candidate('phrase', sentence, seg_start, seg_end)
     end
     for i, item in ipairs(waits) do
