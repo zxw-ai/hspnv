@@ -114,6 +114,7 @@ local CHAR_UF_STEP = WEIGHTS.char_uf_step
 local HEAD_WORDS_MAX = 30
 local LEARN_MAX = 20
 local PRE_RANK = 60
+local SENTENCE_PUNCT = true      -- 整句置顶时，追加一个带句号的变体（写句子场景）
 local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
 local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
 local PREDICT_MAX = 8       -- 空输入联想候选数（menu/page_size 一页 9 个，留 1 位给 predict_next 混合候选）
@@ -149,7 +150,11 @@ local function load_settings(env)
     local dbg = cfg:get_bool('segment_phrase/debug_input')
     if dbg ~= nil then DEBUG_INPUT = dbg end
     if time_context then
-      local te = cfg:get_bool('segment_phrase/time_context')
+      local mo = cfg:get_int('segment_phrase/max_output')
+    if mo and mo > 0 then MAX_OUTPUT = mo end
+    local sp_ = cfg:get_bool('segment_phrase/sentence_punct')
+    if sp_ ~= nil then SENTENCE_PUNCT = sp_ end
+    local te = cfg:get_bool('segment_phrase/time_context')
       local tw = cfg:get_int('segment_phrase/time_weight')
       time_context.configure(te, tw)
     end
@@ -1259,7 +1264,10 @@ local function decode_sentence(parts, env)
         local vec = {}
         if k == 1 then
           for _, ch in ipairs(top_chars(parts[i], 3)) do
-            vec[#vec + 1] = { text = ch, score = lm_char_score(ch, env, prev.last_char) + LM_CTX_W * lm_ctx(prev.last_word, ch, env) }
+            local sc = lm_char_score(ch, env, prev.last_char) + LM_CTX_W * lm_ctx(prev.last_word, ch, env)
+            -- 末字是单字：轻微惩罚，让「词+词」路径优先于「词+单字」的拼接
+            if i == n then sc = sc - 1.2 end
+            vec[#vec + 1] = { text = ch, score = sc }
           end
         else
           local key = {}
@@ -1288,6 +1296,15 @@ local function decode_sentence(parts, env)
     best[i] = cur
   end
   local res = best[n]
+  -- 末单元是「单字」且整句不是词库词 → 判定这句还没打完（如「每段话十」），
+  -- 不作为整句输出，避免无意义的拼接挤占首页。
+  -- 标记「弱整句」：末单元是单字且整句不是词库词（如「每段话十」）。
+  -- 注意不能直接丢弃——那会把「今天天气不错」这类正确整句也砍掉（末字是单字）。
+  -- 只用于「不置顶」，仍然作为普通候选输出。
+  if res and res.segs and #res.segs > 0 then
+    local lastseg = res.segs[#res.segs]
+    if lastseg.from == lastseg.to and not words[res.text] then res.weak = true end
+  end
   -- 后处理：只在「与前后词能组成词」时才改单字（如「明天早上 [八] 点」→ 八点），
   -- 纯字频更高不足以推翻 DP 的选择。注意必须「先收集全部候选再比较」，
   -- 不能边遍历边用 margin 覆盖——char_pool 的顺序受 Lua 哈希随机化影响，会导致结果抖动。
@@ -1498,14 +1515,19 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   -- 用户既不能提前上屏前段，末段没命中时还会看到数字。
   local WHOLE_FIRST = 5     -- 首页整词名额
   local WAITING_FIRST = 2   -- 首页前缀词名额
-  local LAST_CHARS = 4      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
-  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete)
+  local LAST_CHARS = 2      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
+  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete, sent_ok)
     local wholes = whole_phrases or {}
     local waits = waiting_items or {}
     local n_whole, n_wait = 0, 0
     -- 末段已是完整码（用户很可能打完了整句）→ 整句候选置顶
-    if last_complete and sentence and sentence ~= '' then
+    -- 只有「DP 词组合」结果才配置顶（简单拼接的「我们今」这类不算打完）
+    if last_complete and sent_ok and sentence and sentence ~= '' then
       emit_candidate('phrase', sentence, seg_start, seg_end)
+      -- 带句号的变体：写长句时一次上屏，省一个标点键
+      if SENTENCE_PUNCT then
+        emit_candidate('phrase', sentence .. '。', seg_start, seg_end)
+      end
     end
     for i, item in ipairs(wholes) do
       if i > WHOLE_FIRST then break end
@@ -1626,7 +1648,10 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
         if buf then sentence2 = table.concat(buf) end
       end
     end
-    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2)
+    -- 空整词分支同样支持「末段完整 → 整句置顶」（否则 4 段词库无组合时整句拿不到首位）
+    local lpc2 = parts[#parts]
+    local last_complete2 = lpc2 and #lpc2 >= 3 and exact_stroke[lpc2] ~= nil
+    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2, last_complete2, sent2 ~= nil and #sent2.segs >= 2)
 
     -- 3. 无整词时部分回退：保护前段词 + 末段按笔画重新定字（不再整串笔画兜底）
     local has_any = false
@@ -1696,7 +1721,8 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   end
   -- 整句直出候选（「整句输入」的最后一块拼图）：
   --   优先用句子级 DP 解码（多词组合，如 31'32'45'12 → 「我们吃饭」），
-  --   DP 失败时退化为「前 N-1 段最佳前缀词 + 末段最优字」。
+  --   DP 失败时退化为「前 N-1 段最佳前缀词 + 末段最优字」，但**拼接结果必须是词库词**
+  --   （否则会产出「每段话十」这种无意义拼接，挤占首页位置）。
   local sent = decode_sentence(parts, env)
   local sentence = sent and sent.text or nil
   if not sentence and #parts >= 2 and #parts[#parts] >= 2 then
@@ -1716,7 +1742,11 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
     if prefix_text then
       local tail = best_char(parts[#parts])
-      if tail then sentence = prefix_text .. tail end
+      if tail then
+        local joined = prefix_text .. tail
+        -- 只有拼接后确实是词库词、或前缀本身只有 2 段（「我们」+字）时才用
+        if words[joined] or #parts == 2 then sentence = joined end
+      end
     else
       local buf = {}
       for i, pp in ipairs(parts) do
@@ -1731,7 +1761,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   -- 末段「打完」的判定：完整码命中 且 码长 >=3（两笔字的完整码太多，
   -- 如 八=34、了几=52，会把还在输入中的情况误判成整句完成）
   local last_complete = last_part_code and #last_part_code >= 3 and exact_stroke[last_part_code] ~= nil
-  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete)
+  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2)
 
   -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
   if sent and #sent.segs > 1 then
