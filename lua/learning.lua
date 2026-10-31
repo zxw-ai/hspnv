@@ -194,6 +194,10 @@ local function prune_entries()
   return removed
 end
 
+-- 备份目标目录（空 = 与源文件同目录；可配置为共享目录做异地备份）
+-- 注意：必须声明在任何使用它的函数之前（Lua 局部变量作用域从声明行开始）
+local BACKUP_DIR = ''
+
 local function load_config(env)
   local cfg = env and env.engine and env.engine.schema and env.engine.schema.config
   if not cfg then return end
@@ -201,6 +205,9 @@ local function load_config(env)
   if v and v > 0 then MAX_ENTRIES = v end
   local d = cfg:get_int('learning/prune_days')
   if d and d > 0 then PRUNE_STALE_DAYS = d end
+  -- 备份目录（空 = 与源文件同目录）。可指向共享目录做异地备份。
+  local ok_dir, dir = pcall(function() return cfg:get_string('learning/backup_dir') end)
+  if ok_dir and type(dir) == 'string' then BACKUP_DIR = dir end
 end
 
 -- ── 学习数据自动备份 ──────────────────────────────────────────────────────────
@@ -222,14 +229,40 @@ local function copy_file(src, dst)
   return ok
 end
 
+-- 探测目标目录是否真的可写：写一个探针文件，成功就删掉。
+-- 元书 App 与 Minis/iSH 是两个沙盒，宿主路径（如 /var/minis/shared）在元书里通常不存在，
+-- 探测失败时自动回退到源文件目录，避免备份静默丢失。
+local function probe_writable(dir)
+  if dir == '' then return false end
+  local probe = dir .. '/.bg5_backup_probe'
+  local f = io.open(probe, 'w')
+  if not f then return false end
+  local ok = pcall(function() f:write('ok') end)
+  f:close()
+  pcall(os.remove, probe)
+  return ok
+end
+
+local backup_root_cache = nil
+local function backup_root(default_dir)
+  if backup_root_cache ~= nil then return backup_root_cache end
+  if BACKUP_DIR ~= '' and probe_writable(BACKUP_DIR) then
+    backup_root_cache = BACKUP_DIR
+  else
+    backup_root_cache = default_dir
+  end
+  return backup_root_cache
+end
+
 local function auto_backup(now)
   local today = os.date('%Y%m%d', now)
   if last_backup_day == today then return end
   last_backup_day = today
   local d = user_dir()
+  local target = backup_root(d)
   for _, name in ipairs(BACKUP_FILES) do
     local src = d .. '/' .. name
-    local dst = src .. '.' .. today
+    local dst = target .. '/' .. name .. '.' .. today
     local f = io.open(dst, 'r')
     if f then
       f:close()          -- 今天已备份过
@@ -240,7 +273,7 @@ local function auto_backup(now)
   -- 清理过期备份（按日期文件名推算，无需列目录）
   local old_day = os.date('%Y%m%d', now - BACKUP_KEEP_DAYS * 86400)
   for _, name in ipairs(BACKUP_FILES) do
-    pcall(os.remove, d .. '/' .. name .. '.' .. old_day)
+    pcall(os.remove, target .. '/' .. name .. '.' .. old_day)
   end
 end
 
