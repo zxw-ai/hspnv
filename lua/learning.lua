@@ -28,7 +28,8 @@ local loaded = false
 local data = {}             -- 文字/词组 -> { cnt=累计上屏频次, last=最后上屏时间戳 }（唯一持久化数据源）
 local learned = {}          -- 所有学习到的多字词组 -> 频次
 local learned_chars = {}    -- 学习到的单字 -> 频次
-local learned_prefix = {}   -- 学习词组的前缀哈希集合 -> true
+-- 按首字分桶：联想时只遍历对应首字的桶，避免每次按键全表扫描（3 万词条时会卡 400ms+）
+local by_first = {}
 local path = nil
 local revision = 0
 local save_counter = 0
@@ -104,21 +105,11 @@ local function chinese_only(s)
   return true
 end
 
-local function add_learned_prefixes(w)
-  local chars = utf8_chars(w)
-  if #chars <= 1 then return end
-  local prefix = ""
-  for i = 1, #chars - 1 do
-    prefix = prefix .. chars[i]
-    learned_prefix[prefix] = true
-  end
-end
-
 -- 从 data 重建派生索引（加载/衰减时执行）
 local function rebuild_indexes()
   learned = {}
   learned_chars = {}
-  learned_prefix = {}
+  by_first = {}
   for w, item in pairs(data) do
     local cnt = item.cnt
     local chars = utf8_chars(w)
@@ -129,10 +120,15 @@ local function rebuild_indexes()
       end
     else
       learned[w] = cnt
-      add_learned_prefixes(w)
+      local first = chars[1]
+      local bucket = by_first[first]
+      if not bucket then bucket = {}; by_first[first] = bucket end
+      bucket[w] = cnt
     end
   end
 end
+
+
 
 -- 时间衰减：对超过阈值的条目按半衰期降低权重，衰减到 0 的彻底遗忘（删除）
 local function apply_decay(force)
@@ -267,10 +263,11 @@ local function load(env)
     end
     f:close()
   end
-  -- 加载后：先按时间衰减，再按容量规则清理
-  local changed = apply_decay(true)
+  -- 加载后：只做容量清理（O(n) 但简单）；时间衰减改为「查到才衰减」，
+  -- 否则 3 万词条时启动要多花 3 秒。
   local removed = prune_entries()
   rebuild_indexes()
+  local changed = false
   -- 有变化时立即落盘：把「上次衰减时间」写进文件头，
   -- 否则进程退出后内存丢失，下次启动会按同一段时间再衰减一次（重复衰减）。
   if changed or removed > 0 then
@@ -290,10 +287,35 @@ local function save()
   if m and type(m.flush) == 'function' then pcall(m.flush) end
 end
 
+local function decay_item(w, item, now)
+  local base = item.last
+  if item.decayed_at and item.decayed_at > base then base = item.decayed_at end
+  local elapsed = now - base
+  if elapsed < DECAY_MIN_ELAPSED then return item.cnt end
+  local factor = 0.5 ^ (elapsed / (HALF_LIFE_DAYS * 86400))
+  local new_cnt = math.floor(item.cnt * factor + 0.5)
+  if item.cnt >= MIN_FREQ and new_cnt < MIN_FREQ then
+    new_cnt = MIN_FREQ
+  end
+  item.decayed_at = now
+  if new_cnt < 1 then
+    data[w] = nil
+    learned[w] = nil
+    learned_chars[w] = nil
+    return 0
+  end
+  item.cnt = new_cnt
+  learned[w] = new_cnt
+  learned_chars[w] = new_cnt
+  return new_cnt
+end
+
 function M.freq(w, env)
   load(env)
   local item = data[w]
-  return item and item.cnt or 0
+  if not item then return 0 end
+  -- 惰性衰减：很久没算过的条目，查询时才折半（分摊到实际使用中）
+  return decay_item(w, item, os.time())
 end
 
 function M.all(env)
@@ -313,8 +335,9 @@ end
 
 -- O(1) 哈希查询前缀，彻底避免在大规模学习数据下全表扫描卡顿
 function M.has_prefix(prefix, env)
-  load(env)
-  return learned_prefix[prefix] == true
+  -- 已废弃：原用于 O(1) 前缀查询，但没有任何调用方（每次 rebuild 都要遍历所有前缀，
+  -- 3 万词条时是明显的加载负担）。保留空实现以兼容旧调用。
+  return false
 end
 
 -- 累加频次并更新时间戳（新词则创建）；频次封顶 MAX_UF，防止用户词无限增长霸榜。
@@ -346,7 +369,12 @@ function M.add(w, env)
     learned_chars[w] = cnt
   else
     learned[w] = cnt
-    add_learned_prefixes(w)
+    local first = utf8_chars(w)[1]
+    if first then
+      local bucket = by_first[first]
+      if not bucket then bucket = {}; by_first[first] = bucket end
+      bucket[w] = cnt
+    end
   end
 
   revision = revision + 1
@@ -458,7 +486,12 @@ function M.learn_word(w, env)
     learned_chars[w] = cnt
   else
     learned[w] = cnt
-    add_learned_prefixes(w)
+    local first = utf8_chars(w)[1]
+    if first then
+      local bucket = by_first[first]
+      if not bucket then bucket = {}; by_first[first] = bucket end
+      bucket[w] = cnt
+    end
   end
   revision = revision + 1
   save_counter = save_counter + 1
@@ -547,6 +580,15 @@ function M.attach(env)
   c.commit_notifier:connect(on_commit)
   env._bg5_learning_connected = true
   return true
+end
+
+local EMPTY_BUCKET = {}
+-- 按首字取学习词桶（供联想遍历，避免全表扫描）
+-- 注意：必须定义在 `local function load` 之后，否则 load 会解析成全局 load(chunk)
+function M.bucket(first_char, env)
+  load(env)
+  if not first_char or first_char == '' then return EMPTY_BUCKET end
+  return by_first[first_char] or EMPTY_BUCKET
 end
 
 return M

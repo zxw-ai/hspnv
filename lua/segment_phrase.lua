@@ -1388,7 +1388,24 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   end
 
   -- 3. 用户自造/已学词库注入（上屏学习后始终参与召回，权重按 learning 频次排序）
-  for w in pairs(learning.all(env)) do
+  -- 首字必须匹配 parts[1]：先取该段可能的字，再只查这些字的桶
+  local first_cands = {}
+  for _, ch in ipairs((function()
+    local out = {}
+    local ex = exact_stroke[parts[1]]
+    if ex then for _, c in ipairs(ex) do out[#out + 1] = c end end
+    local ix = index[parts[1]]
+    if ix then for i = 1, math.min(#ix, 12) do out[#out + 1] = ix[i][1] end end
+    return out
+  end)()) do first_cands[ch] = true end
+  local seen_learn = {}
+  local learn_cands = {}
+  for ch in pairs(first_cands) do
+    for w in pairs(learning.bucket(ch, env)) do
+      if not seen_learn[w] then seen_learn[w] = true; learn_cands[#learn_cands + 1] = w end
+    end
+  end
+  for _, w in ipairs(learn_cands) do
     local chs = utf8_chars(w)
     if #chs == target_len then
       local matched = true
@@ -2147,7 +2164,7 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
           end
         end
       end
-      for w, uf in pairs(learning.all(env)) do
+      for w, uf in pairs(learning.bucket(utf8_first_char(head), env)) do
         if #w > h_len and w:sub(1, h_len) == head then
           local sf = words[w] or 0
           local chs_n = 0
@@ -2442,7 +2459,8 @@ local function build_predict_continuations(env)
 
   -- 3. 在用户学习库中寻找（同样限制匹配数，用户词库膨胀后仍保持候选池可控）
   local learn_hits = 0
-  for w, uf in pairs(learning.all(env)) do
+  -- 只遍历「首字 = last 首字」的学习桶（避免 3 万词条时每次按键全表扫描）
+  for w, uf in pairs(learning.bucket(utf8_first_char(last), env)) do
     if #w > l_len and w:sub(1, l_len) == last then
       learn_hits = learn_hits + 1
       -- 不在遍历中截断：pairs 顺序不稳定，截断会让候选集在两次启动间抖动
@@ -2653,7 +2671,11 @@ local function translator_body(input, seg, env)
   -- 必须放在任何提前 return 分支（降权/下移等功能键）之前，
   -- 否则误触 [ ] 等键时预编辑区会回退显示原始数字。
   force_preedit(env, input)
-  if pos_memory and input and input ~= '' then pos_memory.set_code(input) end
+  -- 码内偏好只对「单段长码」记录：多段输入时 translator 收到的可能是段子串，
+  -- 且用户可能只选中前缀词（span 只覆盖部分），记下来的「码→词」会错配。
+  if pos_memory and input and input ~= '' and not input:find("'", 1, true) and #input >= 3 then
+    pos_memory.set_code(input)
+  end
 
   -- 多段 composition 兼容（关键）：
   -- librime 的 TranslateSegments 对每个段单独调用 translator，传入的 input 是
