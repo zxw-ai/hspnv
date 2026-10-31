@@ -195,6 +195,7 @@ segment_phrase:
   word_uf_step: 30000   # 联想排序：用户上屏 1 次 ≈ 静态词频 30000（10 次封顶≈离线 bigram 首位）
   char_uf_step: 100000  # 单字候选排序：用户上屏 1 次 ≈ 静态字频 100000
   max_output: 60        # 候选总数上限（60 ≈ 7 页；调小可减少翻页负担）
+  reorder_tolerance: true  # 相邻两笔顺序颠倒容错（如 木 1234 打成 1243 也能出）
   sentence_punct: true  # 整句置顶时追加「整句+句号」变体
   time_context: true    # 时段感知：早/中/晚/深夜给相关词加分（只在无强上下文时生效）
   time_weight: 150000   # 时段加分额度（与静态语料同量级才有效）

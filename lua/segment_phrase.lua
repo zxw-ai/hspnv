@@ -143,6 +143,8 @@ local function load_settings(env)
     if wu and wu > 0 then WORD_UF_STEP = wu end
     local cu = cfg:get_int('segment_phrase/char_uf_step')
     if cu and cu > 0 then CHAR_UF_STEP = cu end
+    local rdo = cfg:get_bool('segment_phrase/reorder_tolerance')
+    if rdo ~= nil then REORDER_ON = rdo end
     local cbg = cfg:get_bool('segment_phrase/char_bigram')
     if cbg ~= nil and LM and LM.set_char_bigram then LM.set_char_bigram(cbg) end
     local bm = cfg:get_bool('segment_phrase/beam_sentence')
@@ -282,6 +284,9 @@ if KEY_NEIGHBOR_ON then
   end
 end
 local correction_stroke_on = true
+-- 相邻两笔顺序颠倒容错（对标搜狗「笔画顺序校正」）
+local REORDER_ON = true
+local MAX_REORDER = 6      -- 最多生成 6 个互换变体（长码时限制爆炸）
 
 -- 生成 seg 的所有「单位置易混替换」变体码（去重）
 local function correction_variants(seg)
@@ -302,6 +307,26 @@ local function correction_variants(seg)
         if not seen[v] then
           seen[v] = true
           variants[#variants + 1] = v
+        end
+      end
+    end
+  end
+  -- 相邻两笔顺序颠倒容错（对标搜狗「笔画顺序校正」）：
+  -- 最常见的笔误是相邻两笔写反（如「木」的撇捺、「口」的竖折）。
+  -- 从后往前生成，越靠后的位置越容易错；总数受 MAX_REORDER 限制，避免长码变体爆炸。
+  if REORDER_ON then
+    local made = 0
+    for i = #chars - 1, 1, -1 do
+      if made >= MAX_REORDER then break end
+      if chars[i] ~= chars[i + 1] then
+        local clone = {}
+        for j = 1, #chars do clone[j] = chars[j] end
+        clone[i], clone[i + 1] = clone[i + 1], clone[i]
+        local v = table.concat(clone)
+        if not seen[v] then
+          seen[v] = true
+          variants[#variants + 1] = v
+          made = made + 1
         end
       end
     end
@@ -2820,7 +2845,9 @@ local function translator_body(input, seg, env)
       if BEAM_ENABLE and #core >= 8 then emit_beam_sentence(core, seg, env) end
       -- 整句输入：连续码自动组词（不打分词符也能出「我们」这类词）
       local has_exact = exact_stroke[core] and #exact_stroke[core] > 0
-      if has_exact then
+      -- 短码（<=4 位）优先出单字：4 位码通常是「一个字的完整笔顺」（含笔误），
+      -- 若先出自动组词，会把纠错命中的本字挤到后面（如 1243 撇捺写反 → 木 排第 7）。
+      if has_exact or #core <= 4 then
         -- 整串恰好是某个字的完整码：单字优先，词随后
         emit_single(core, seg, env)
         emit_auto_words(core, seg, env)
@@ -2840,12 +2867,33 @@ end
 
 -- 兜底包装：任何 Lua 异常都不能让当前段的菜单变空。
 -- 菜单为空的段，Rime 会用原始编码渲染预编辑区（数字），这也是「某个字后面出现数字」的常见成因。
+-- 候选数按输入规模动态调整（对标搜狗/百度的「短码少、长码多」体验）：
+--   1~2 笔  → 27（3 页，单字选择够用，翻页负担小）
+--   3~5 段  → 60（7 页，当前默认）
+--   6 段以上 → 90（10 页，整句组合多）
+local CAP_SHORT, CAP_MID, CAP_LONG = 27, 60, 90
+local function dynamic_cap(input)
+  if not input or input == '' then return CAP_MID end
+  local segs = 1
+  for _ in input:gmatch("'") do segs = segs + 1 end
+  if segs >= 6 then return CAP_LONG end
+  if segs >= 3 then return CAP_MID end
+  -- 少段：按笔数判断（3 笔以内算短码）
+  local strokes = #input:gsub("'", "")
+  if strokes <= 3 then return CAP_SHORT end
+  return CAP_MID
+end
+
 local function translator(input, seg, env)
   local n = 0
   local orig_yield = yield
+  -- 动态候选上限（结束后恢复，避免影响其他调用）
+  local saved_cap = MAX_OUTPUT
+  MAX_OUTPUT = dynamic_cap(input)
   -- 计数包装（仅为了诊断日志；yield 是 librime-lua 注入的全局函数）
   yield = function(c) n = n + 1; orig_yield(c) end
   local ok, err = pcall(translator_body, input, seg, env)
+  MAX_OUTPUT = saved_cap
   yield = orig_yield
   if not ok and seg and seg.start ~= nil and seg._end ~= nil then
     pcall(function()

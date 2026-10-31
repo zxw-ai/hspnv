@@ -203,6 +203,47 @@ local function load_config(env)
   if d and d > 0 then PRUNE_STALE_DAYS = d end
 end
 
+-- ── 学习数据自动备份 ──────────────────────────────────────────────────────────
+-- 每天第一次落盘时，把学习库/上下文/偏好各复制一份带日期的备份，
+-- 保留最近 BACKUP_KEEP_DAYS 天（更早的按日期名直接删除，无需遍历目录）。
+-- 纯 Lua 实现（只用 io.open 读写 + os.remove），不依赖 os.execute，iOS 沙盒也安全。
+local BACKUP_KEEP_DAYS = 7
+local BACKUP_FILES = { 'bg5-learning.user.tsv', 'bg5-ngram.user.tsv', 'pos_memory.tsv' }
+local last_backup_day = nil
+
+local function copy_file(src, dst)
+  local i = io.open(src, 'r')
+  if not i then return false end
+  local o = io.open(dst, 'w')
+  if not o then i:close() return false end
+  local ok = pcall(function() o:write(i:read('a')) end)
+  o:close()
+  i:close()
+  return ok
+end
+
+local function auto_backup(now)
+  local today = os.date('%Y%m%d', now)
+  if last_backup_day == today then return end
+  last_backup_day = today
+  local d = user_dir()
+  for _, name in ipairs(BACKUP_FILES) do
+    local src = d .. '/' .. name
+    local dst = src .. '.' .. today
+    local f = io.open(dst, 'r')
+    if f then
+      f:close()          -- 今天已备份过
+    else
+      copy_file(src, dst)  -- 源文件不存在时 copy_file 返回 false，无需额外判断
+    end
+  end
+  -- 清理过期备份（按日期文件名推算，无需列目录）
+  local old_day = os.date('%Y%m%d', now - BACKUP_KEEP_DAYS * 86400)
+  for _, name in ipairs(BACKUP_FILES) do
+    pcall(os.remove, d .. '/' .. name .. '.' .. old_day)
+  end
+end
+
 local function safe_save_file(p, table_data)
   if not p then return end
   local tmp = p .. '.tmp.' .. tostring(math.random(100000, 999999))
@@ -285,6 +326,8 @@ local function save()
   -- 顺带落盘「码内候选偏好」（同一节奏，避免它一直留在内存里）
   local m = pm()
   if m and type(m.flush) == 'function' then pcall(m.flush) end
+  -- 每天自动备份一次（学习库 / 上下文 / 偏好）
+  pcall(auto_backup, os.time())
 end
 
 local function decay_item(w, item, now)
