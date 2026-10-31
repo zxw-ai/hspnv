@@ -148,6 +148,11 @@ local function load_settings(env)
     if bm ~= nil then BEAM_ENABLE = bm end
     local dbg = cfg:get_bool('segment_phrase/debug_input')
     if dbg ~= nil then DEBUG_INPUT = dbg end
+    if time_context then
+      local te = cfg:get_bool('segment_phrase/time_context')
+      local tw = cfg:get_int('segment_phrase/time_weight')
+      time_context.configure(te, tw)
+    end
     local shf = cfg:get_int('segment_phrase/short_head_freeze')
     if shf and shf >= 0 then SHORT_HEAD_FREEZE = shf end
     local sub = cfg:get_int('segment_phrase/short_uf_boost')
@@ -691,6 +696,12 @@ local function utf8_first_char(s)
 end
 
 local preedit_util = require('preedit_util')
+-- 时段感知（让补全更贴合「现在几点」）
+local time_context = nil
+do
+  local ok, m = pcall(require, 'time_context')
+  if ok and type(m) == 'table' then time_context = m end
+end
 -- 码内候选偏好（长码下用户常选哪个候选）
 local pos_memory = nil
 do
@@ -1488,17 +1499,22 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   local WHOLE_FIRST = 5     -- 首页整词名额
   local WAITING_FIRST = 2   -- 首页前缀词名额
   local LAST_CHARS = 4      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
-  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence)
+  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete)
     local wholes = whole_phrases or {}
     local waits = waiting_items or {}
     local n_whole, n_wait = 0, 0
+    -- 末段已是完整码（用户很可能打完了整句）→ 整句候选置顶
+    if last_complete and sentence and sentence ~= '' then
+      emit_candidate('phrase', sentence, seg_start, seg_end)
+    end
     for i, item in ipairs(wholes) do
       if i > WHOLE_FIRST then break end
       n_whole = i
       emit_candidate('phrase', item.text, seg_start, seg_end)
     end
     -- 整句直出：每段取最优单字拼成整句（词库没有对应整词时也能「整句上屏」）
-    if sentence and sentence ~= '' then
+    -- 末段完整时时已在最前面输出过，这里不重复
+    if sentence and sentence ~= '' and not last_complete then
       emit_candidate('phrase', sentence, seg_start, seg_end)
     end
     for i, item in ipairs(waits) do
@@ -1711,7 +1727,11 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
       if buf then sentence = table.concat(buf) end
     end
   end
-  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence)
+  local last_part_code = parts[#parts]
+  -- 末段「打完」的判定：完整码命中 且 码长 >=3（两笔字的完整码太多，
+  -- 如 八=34、了几=52，会把还在输入中的情况误判成整句完成）
+  local last_complete = last_part_code and #last_part_code >= 3 and exact_stroke[last_part_code] ~= nil
+  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete)
 
   -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
   if sent and #sent.segs > 1 then
@@ -2230,6 +2250,8 @@ local function build_predict_continuations(env)
     tostring(learning.get_prev3_commit()),
     tostring(learning.revision and learning.revision() or 0),
     punc_ctx or '',
+    -- 时段参与缓存键：否则跨时段（如早上算过、晚上再用）会命中旧结果
+    time_context and time_context.period_key and time_context.period_key() or '',
   }, '\1')
   if predict_cache_key == cache_key then return predict_cache_result end
   local l_len = #last
@@ -2250,8 +2272,13 @@ local function build_predict_continuations(env)
     ["再"]=true,["又"]=true,["还"]=true,["却"]=true,["但"]=true,["所以"]=true,
     ["因为"]=true,["然后"]=true,["但是"]=true,["如果"]=true,
   }
+  -- 时段加分（只在没有强上下文时生效，避免覆盖真实搭配）
+  local time_scores = time_context and time_context.scores() or nil
   local function cf_of(w)
     local base = ngram.word_freq(last, w, env)
+    if time_scores and base == 0 and time_scores[w] then
+      base = base + time_scores[w]
+    end
     if punc_ctx then
       -- 标点后的下一句首词：ngram 记的是「。→明天」这类跨句搭配
       base = base + ngram.word_freq(punc_ctx, w, env)

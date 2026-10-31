@@ -194,6 +194,8 @@ segment_phrase:
   debug_input: false # 排查用：true 时把每次按键的 input/ctx.input/段范围/候选数写入 bg5_input.log
   word_uf_step: 30000   # 联想排序：用户上屏 1 次 ≈ 静态词频 30000（10 次封顶≈离线 bigram 首位）
   char_uf_step: 100000  # 单字候选排序：用户上屏 1 次 ≈ 静态字频 100000
+  time_context: true    # 时段感知：早/中/晚/深夜给相关词加分（只在无强上下文时生效）
+  time_weight: 150000   # 时段加分额度（与静态语料同量级才有效）
   short_head_freeze: 2  # 短码（1~2 笔）：前 N 位冻结（保住《首两笔速查》），之后按用户频次重排
   short_uf_boost: 40000000  # 短码第 N+1 位起：用户上屏 1 次 ≈ 静态字频 4000 万
 
