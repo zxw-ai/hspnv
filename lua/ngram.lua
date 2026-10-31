@@ -12,6 +12,8 @@ local loaded = false
 local data = {}         -- 前词..'\t'..后词 -> 次数
 local char_data = {}    -- 前词..'\t'..首字 -> 次数
 local tri_data = {}     -- 前二词..'\t'..前词..'\t'..后词 -> 次数（用户三元组）
+-- 每条搭配的最后使用时间（用于按龄衰减：查询时打折，不改存储）
+local data_ts, char_ts, tri_ts = {}, {}, {}
 -- 个人语料种子（只读）：与用户实时学习分开存放，避免被写回用户文件
 local seed_data, seed_char, seed_tri = {}, {}, {}
 local by_prev = {}      -- 前词 -> {后词=次数} 索引（next_words 免全表遍历，长期使用性能优化）
@@ -34,6 +36,7 @@ local CHAR_CAP = 2
 local TRI_ENABLE = true      -- 用户三元组（前两个词 -> 下一个词）
 local TRI_CAP = 2            -- 三元组次数上限（防止单条霸榜）
 local TRI_MAX_ENTRIES = 20000 -- 三元组条目上限（超出时丢弃只出现 1 次的旧搭配，控制内存与写盘）
+local HALF_LIFE_DAYS = 30    -- 搭配半衰期：30 天不用，权重减半（只影响查询打分，不改存储）
 
 local function user_dir()
   if rime_api and rime_api.get_user_data_dir then
@@ -80,6 +83,14 @@ local function is_valid_unit(s)
   return chinese_only(s)
 end
 
+-- 按「最后使用时间」打折：0.5 ^ (龄 / 半衰期)
+local function decay_factor(ts)
+  if not ts or ts <= 0 then return 1 end
+  local age = os.time() - ts
+  if age <= 0 then return 1 end
+  return 0.5 ^ (age / (HALF_LIFE_DAYS * 86400))
+end
+
 local function load_config(env)
   if not env or not env.engine or not env.engine.schema or not env.engine.schema.config then return end
   local cfg = env.engine.schema.config
@@ -98,6 +109,8 @@ local function load_config(env)
   if v ~= nil then TRI_ENABLE = v end
   v = cfg:get_int("ngram/tri_cap")
   if v then TRI_CAP = v end
+  v = cfg:get_int("ngram/half_life_days")
+  if v and v > 0 then HALF_LIFE_DAYS = v end
 end
 
 local function rebuild_tri_index()
@@ -156,15 +169,28 @@ local function load(env)
   local f = io.open(path, 'r')
   if f then
     for line in f:lines() do
-      local kind, a, b, n = line:match('^([WC])\t([^\t]+)\t([^\t]+)\t(%d+)$')
+      -- 新格式带时间戳：W\t前词\t后词\t次数\t时间；旧格式只有 4 列
+      local kind, a, b, n, ts = line:match('^([WC])\t([^\t]+)\t([^\t]+)\t(%d+)\t(%d+)$')
+      if not kind then
+        kind, a, b, n = line:match('^([WC])\t([^\t]+)\t([^\t]+)\t(%d+)$')
+      end
+      ts = tonumber(ts) or 0
       if kind == 'W' then
-        data[a .. '\t' .. b] = tonumber(n)
+        local k = a .. '\t' .. b
+        data[k] = tonumber(n)
+        if ts > 0 then data_ts[k] = ts end
       elseif kind == 'C' then
-        char_data[a .. '\t' .. b] = tonumber(n)
+        local k = a .. '\t' .. b
+        char_data[k] = tonumber(n)
+        if ts > 0 then char_ts[k] = ts end
       else
-        -- 三元组：T<p2><p1><w><n>
-        local c1, c2, c3, c4 = line:match('^T\t([^\t]+)\t([^\t]+)\t([^\t]+)\t(%d+)$')
-        if c1 then tri_data[c1 .. '\t' .. c2 .. '\t' .. c3] = tonumber(c4) end
+        local c1, c2, c3, c4, c5 = line:match('^T\t([^\t]+)\t([^\t]+)\t([^\t]+)\t(%d+)\t(%d+)$')
+        if not c1 then c1, c2, c3, c4 = line:match('^T\t([^\t]+)\t([^\t]+)\t([^\t]+)\t(%d+)$') end
+        if c1 then
+          local k = c1 .. '\t' .. c2 .. '\t' .. c3
+          tri_data[k] = tonumber(c4)
+          if tonumber(c5) then tri_ts[k] = tonumber(c5) end
+        end
       end
     end
     f:close()
@@ -197,17 +223,18 @@ local function safe_save(p, t1, t2, t3)
   local f = nil
   local ok = pcall(function()
     f = assert(io.open(tmp, 'w'))
+    local now = os.time()
     for k, n in pairs(t1) do
       local a, b = k:match('^([^\t]+)\t([^\t]+)$')
-      if a and b then f:write('W\t', a, '\t', b, '\t', tostring(n), '\n') end
+      if a and b then f:write('W\t', a, '\t', b, '\t', tostring(n), '\t', tostring(data_ts[k] or now), '\n') end
     end
     for k, n in pairs(t2) do
       local a, b = k:match('^([^\t]+)\t([^\t]+)$')
-      if a and b then f:write('C\t', a, '\t', b, '\t', tostring(n), '\n') end
+      if a and b then f:write('C\t', a, '\t', b, '\t', tostring(n), '\t', tostring(char_ts[k] or now), '\n') end
     end
     for k, n in pairs(t3) do
       local a, b, c = k:match('^([^\t]+)\t([^\t]+)\t([^\t]+)$')
-      if a and b and c then f:write('T\t', a, '\t', b, '\t', c, '\t', tostring(n), '\n') end
+      if a and b and c then f:write('T\t', a, '\t', b, '\t', c, '\t', tostring(n), '\t', tostring(tri_ts[k] or now), '\n') end
     end
     f:close()
     f = nil
@@ -226,7 +253,12 @@ function M.word_freq(prev, w, env)
   if not ENABLED or not prev or prev == '' or not w or w == '' then return 0 end
   local k = prev .. '\t' .. w
   local n = data[k] or seed_data[k]
-  if n then return math.min(n, WORD_CAP) * WORD_STEP end
+  if n then
+    local f = 1
+    local ts = data_ts[k]
+    if ts then f = decay_factor(ts) end
+    return math.min(n, WORD_CAP) * WORD_STEP * f
+  end
   return 0
 end
 
@@ -235,7 +267,12 @@ function M.char_freq(prev, ch, env)
   if not ENABLED or not prev or prev == '' or not ch or ch == '' then return 0 end
   local k = prev .. '\t' .. ch
   local n = char_data[k] or seed_char[k]
-  if n then return math.min(n, CHAR_CAP) * CHAR_STEP end
+  if n then
+    local f = 1
+    local ts = char_ts[k]
+    if ts then f = decay_factor(ts) end
+    return math.min(n, CHAR_CAP) * CHAR_STEP * f
+  end
   return 0
 end
 
@@ -259,8 +296,11 @@ function M.next_words(prev, env)
   local bp = by_prev[prev]
   if not bp then return {} end
   local out = {}
+  local now = os.time()
   for w, n in pairs(bp) do
-    out[#out + 1] = { word = w, cnt = n }
+    local ts = data_ts[prev .. '\t' .. w]
+    local f = ts and decay_factor(ts) or 1
+    out[#out + 1] = { word = w, cnt = n * f }
   end
   -- 同次数时按词排序：Lua 的 pairs 顺序不稳定，不加 tie-break 会让同一份数据的
   -- 联想顺序在两次启动间抖动（排序名次还会影响 sf 递减）。
@@ -308,7 +348,9 @@ function M.next_words3(p2, p1, env)
   if not bp2 then return {} end
   local out = {}
   for w, n in pairs(bp2) do
-    out[#out + 1] = { word = w, cnt = n }
+    local ts = tri_ts[p2 .. '\t' .. p1 .. '\t' .. w]
+    local f = ts and decay_factor(ts) or 1
+    out[#out + 1] = { word = w, cnt = n * f }
   end
   table.sort(out, function(a, b)
     if a.cnt ~= b.cnt then return a.cnt > b.cnt end
@@ -325,8 +367,10 @@ local function learn_pair(prev, cur, p2)
   -- 至少一方是中文词/字；不允许「标点 -> 标点」
   if not is_valid_unit(prev) or not is_valid_unit(cur) then return end
   if is_punct(prev) and is_punct(cur) then return end
+  local now = os.time()
   local wk = prev .. '\t' .. cur
   data[wk] = (data[wk] or 0) + 1
+  data_ts[wk] = now
   -- 同步更新前词索引
   local bp = by_prev[prev]
   if not bp then bp = {}; by_prev[prev] = bp end
@@ -337,6 +381,7 @@ local function learn_pair(prev, cur, p2)
     local tk = p2 .. '\t' .. prev .. '\t' .. cur
     if tri_data[tk] == nil then tri_count = tri_count + 1 end
     tri_data[tk] = (tri_data[tk] or 0) + 1
+    tri_ts[tk] = now
     if tri_count > TRI_MAX_ENTRIES then
       -- 超过上限：丢弃只出现 1 次的旧搭配，控制内存与写盘
       local keep = {}
@@ -359,6 +404,7 @@ local function learn_pair(prev, cur, p2)
   if first then
     local ck = prev .. '\t' .. first
     char_data[ck] = (char_data[ck] or 0) + 1
+    char_ts[ck] = now
   end
 end
 

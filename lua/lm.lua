@@ -33,6 +33,37 @@ function M.p_word(w)
   return LOG10(f) - LOG10(token.total_words)
 end
 
+-- 字级 token 概率（不带「独立成词」折扣，用于整句逐字路径打分）
+function M.p_char_token(ch)
+  ensure()
+  if not token then return UNKNOWN_CHAR end
+  local f = token.chars and token.chars[ch]
+  if not f or f <= 0 then return UNKNOWN_CHAR end
+  return LOG10(f) - LOG10(token.total_chars)
+end
+
+-- 字二元：log10 P(下一个字 | 上一个字)；没有记录返回 nil
+-- 默认关闭：数据 1.5MB、首次加载约 300ms，而实测在现有评测集上未见量化提升。
+-- 需要时把 schema 的 segment_phrase/char_bigram 改 true（会惰性加载 char_bigram.lua）。
+local CHAR_BIGRAM_ENABLE = false
+local char_bigram = nil
+local char_bigram_checked = false
+function M.set_char_bigram(v) CHAR_BIGRAM_ENABLE = (v ~= false) end
+function M.p_char_bigram(prev_ch, ch)
+  if not CHAR_BIGRAM_ENABLE then return nil end
+  if os.getenv('NO_CHAR_BIGRAM') then return nil end
+  if not prev_ch or prev_ch == '' or not ch or ch == '' then return nil end
+  if not char_bigram_checked then
+    char_bigram_checked = true
+    local ok, v = pcall(require, 'char_bigram')
+    if ok and type(v) == 'table' then char_bigram = v end
+  end
+  if not char_bigram then return nil end
+  local n = char_bigram.pairs[prev_ch .. '\t' .. ch]
+  if not n or n <= 0 then return nil end
+  return LOG10(n) - LOG10(char_bigram.total)
+end
+
 -- 单字作为「独立词」的比例：字 token 频率包含它在多字词里的出现，
 -- 直接当词概率会严重高估（导致句子解码倾向拆字）。取经验比例 12%。
 local STANDALONE_RATIO = 0.12

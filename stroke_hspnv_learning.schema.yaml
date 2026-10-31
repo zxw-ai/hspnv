@@ -184,6 +184,8 @@ segment_phrase:
   learn_max: 20      # 用户学习库联想最大匹配数（用户词库膨胀后仍保持候选池可控）
   pre_rank: 60       # 粗排候选数（仅对前列做语言模型精排，控制 gram 查询量）
   predict_max: 8     # 空输入联想候选数（一页 9 个，其余留给混合快捷候选）
+  beam_sentence: false # 无分词整句 beam（实测歧义大，默认关闭）
+  char_bigram: false   # 字二元打分（数据 1.5MB，实测未见提升，默认关闭）
   debug_input: false # 排查用：true 时把每次按键的 input/ctx.input/段范围/候选数写入 bg5_input.log
   word_uf_step: 30000   # 联想排序：用户上屏 1 次 ≈ 静态词频 30000（10 次封顶≈离线 bigram 首位）
   char_uf_step: 100000  # 单字候选排序：用户上屏 1 次 ≈ 静态字频 100000

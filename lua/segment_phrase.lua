@@ -120,6 +120,7 @@ local GRAM_WEIGHT = 60000
 local gram_model_ref = nil
 local gram_model_ok = false
 local settings_loaded = false
+local BEAM_ENABLE = false   -- 无分词整句 beam：实测歧义大（同码字多、无词边界），默认关闭
 local DEBUG_INPUT = false   -- segment_phrase/debug_input：把每次按键的 input/seg 写入日志，排查用
 
 local function load_settings(env)
@@ -139,6 +140,10 @@ local function load_settings(env)
     if wu and wu > 0 then WORD_UF_STEP = wu end
     local cu = cfg:get_int('segment_phrase/char_uf_step')
     if cu and cu > 0 then CHAR_UF_STEP = cu end
+    local cbg = cfg:get_bool('segment_phrase/char_bigram')
+    if cbg ~= nil and LM and LM.set_char_bigram then LM.set_char_bigram(cbg) end
+    local bm = cfg:get_bool('segment_phrase/beam_sentence')
+    if bm ~= nil then BEAM_ENABLE = bm end
     local dbg = cfg:get_bool('segment_phrase/debug_input')
     if dbg ~= nil then DEBUG_INPUT = dbg end
     local pm = cfg:get_int('segment_phrase/predict_max')
@@ -1133,13 +1138,19 @@ local function lm_word_score(w, env, fallback_freq)
   return base + LM_UF_W * LOG10(1 + (learning.freq(w, env) or 0))
 end
 
-local function lm_char_score(ch, env)
+local function lm_char_score(ch, env, prev_char)
   local base = -12
   if LM and LM.p_char then
     local ok, v = pcall(LM.p_char, ch)
     if ok and v then base = v end
   end
-  return base + LM_UF_W * LOG10(1 + (learning.freq(ch, env) or 0))
+  base = base + LM_UF_W * LOG10(1 + (learning.freq(ch, env) or 0))
+  -- 字二元：P(本字 | 上一个字)，帮助逐字路径选到更通顺的字
+  if prev_char and prev_char ~= '' and LM and LM.p_char_bigram then
+    local ok, v = pcall(LM.p_char_bigram, prev_char, ch)
+    if ok and v then base = base + 0.5 * v end
+  end
+  return base
 end
 
 local sentence_cache_key, sentence_cache_val = nil, nil
@@ -1152,7 +1163,7 @@ local function decode_sentence(parts, env)
     if pp:find("?", 1, true) then return nil end
   end
   local last = learning.get_last_commit() or ''
-  local best = { [0] = { score = 0, text = '', segs = {}, last_word = last } }
+  local best = { [0] = { score = 0, text = '', segs = {}, last_word = last, last_char = '' } }
   -- 单字候选池：先放「完整码精确字」（几/了 这类字在 chars_for 的按词频排序里可能被挤到很后），
   -- 再补 chars_for 前若干个；去重后按语言模型概率重排。
   local function char_pool(part)
@@ -1201,7 +1212,7 @@ local function decode_sentence(parts, env)
         local vec = {}
         if k == 1 then
           for _, ch in ipairs(top_chars(parts[i], 3)) do
-            vec[#vec + 1] = { text = ch, score = lm_char_score(ch, env) + LM_CTX_W * lm_ctx(prev.last_word, ch, env) }
+            vec[#vec + 1] = { text = ch, score = lm_char_score(ch, env, prev.last_char) + LM_CTX_W * lm_ctx(prev.last_word, ch, env) }
           end
         else
           local key = {}
@@ -1222,7 +1233,7 @@ local function decode_sentence(parts, env)
             local segs = {}
             for _, x in ipairs(prev.segs) do segs[#segs + 1] = x end
             segs[#segs + 1] = { text = cand.text, from = i - k + 1, to = i }
-            cur = { score = total, text = prev.text .. cand.text, segs = segs, last_word = cand.text }
+            cur = { score = total, text = prev.text .. cand.text, segs = segs, last_word = cand.text, last_char = cand.text:match("([^\1-\127\194-\244][\128-\191]*)$") or '' }
           end
         end
       end
@@ -1238,7 +1249,8 @@ local function decode_sentence(parts, env)
       if sg.from == sg.to then
         local prev_w = (idx > 1) and res.segs[idx - 1].text or last
         local next_w = res.segs[idx + 1] and res.segs[idx + 1].text
-        local orig_sc = lm_char_score(sg.text, env) + LM_CTX_W * lm_ctx(prev_w, sg.text, env)
+        local prev_char = prev_w and prev_w:match("([^\1-\127\194-\244][\128-\191]*)$") or ''
+        local orig_sc = lm_char_score(sg.text, env, prev_char) + LM_CTX_W * lm_ctx(prev_w, sg.text, env)
         local best_ch, best_sc = nil, nil
         local pool = char_pool(parts[sg.from])
         for _, ch in ipairs(pool) do
@@ -1253,7 +1265,7 @@ local function decode_sentence(parts, env)
               if w1 and w1 > 500 then bonus = 1.2 end
             end
             if bonus > 0 then
-              local sc = lm_char_score(ch, env) + LM_CTX_W * lm_ctx(prev_w, ch, env) + bonus
+              local sc = lm_char_score(ch, env, prev_char) + LM_CTX_W * lm_ctx(prev_w, ch, env) + bonus
               if not best_sc or sc > best_sc + 1e-9
                  or (math.abs(sc - best_sc) <= 1e-9 and ch < best_ch) then
                 best_sc, best_ch = sc, ch
@@ -1684,6 +1696,146 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   end
 end
 
+
+-- 无分词连续码的整句解码：beam search 求最优「字切分」，再交给 decode_sentence 合并成词。
+--   旧版只做 2~3 段的单词级切分；这里用 beam 把整串切成字，再组合成句。
+--   复杂度：L × K × MAXLEN × 3 ≈ 20×3×10×3 = 1800 次查表，可接受。
+local BEAM_K = 8
+local BEAM_MAXLEN = 9   -- 常用字笔顺码集中在 4~9 位；10 位以上基本是生僻字
+local BEAM_MINLEN = 1
+
+-- 码长先验：随机取一个汉字，其笔画码长度为 n 的概率（log10）
+-- 用来抑制「用超长码的生僻字吞掉整串」的错误切分。
+local len_prior = nil
+local function get_len_prior()
+  if len_prior then return len_prior end
+  len_prior = {}
+  local ok, token = pcall(require, 'char_freq_token')
+  if not ok or type(token) ~= 'table' or not token.chars then return len_prior end
+  local total = 0
+  for ch, f in pairs(token.chars) do
+    local code = stroke[ch]
+    if code then
+      local n = #code
+      if n > 16 then n = 16 end
+      len_prior[n] = (len_prior[n] or 0) + f
+      total = total + f
+    end
+  end
+  if total > 0 then
+    for n, v in pairs(len_prior) do
+      len_prior[n] = math.log10(v / total)
+    end
+  end
+  return len_prior
+end
+
+local function beam_char_score(ch, prev_ch, len)
+  local base = -8
+  if LM and LM.p_char_token then
+    local ok, v = pcall(LM.p_char_token, ch)
+    if ok and v then base = v end
+  end
+  if LM and LM.p_char_bigram and prev_ch and prev_ch ~= '' then
+    local ok, v = pcall(LM.p_char_bigram, prev_ch, ch)
+    if ok and v then base = base + 0.6 * v else base = base - 1.0 end
+  end
+  local lp = get_len_prior()
+  if lp[len] then base = base + lp[len] end
+  -- 额外长度惩罚：1~2 位（单笔字）与 10 位以上（生僻字）都少见
+  if len <= 2 then base = base - 1.5
+  elseif len >= 10 then base = base - 3.0 end
+  return base
+end
+
+local function beam_parts(code, env)
+  local L = #code
+  if L < 4 then return nil end
+  local dp = { [0] = { { score = 0, parts = {}, last = '', text = '' } } }
+  for i = 0, L - 1 do
+    local states = dp[i]
+    -- 注意：某层没有状态是正常的（正确切分不会经过每一个位置），
+    -- 这里必须 continue 而不是 break，否则后面的层永远不会被展开。
+    if not states or #states == 0 then goto continue end
+    table.sort(states, function(a, b) return a.score > b.score end)
+    if #states > BEAM_K then
+      for j = #states, BEAM_K + 1, -1 do states[j] = nil end
+    end
+    for _, st in ipairs(states) do
+      local maxlen = math.min(BEAM_MAXLEN, L - i)
+      for len = 1, maxlen do
+        local sub = code:sub(i + 1, i + len)
+        local list = exact_stroke[sub]
+        if list then
+          local scored = {}
+          for _, ch in ipairs(list) do
+            if not NON_WORD_CHARS[ch] and not PRIORITY_COMPONENTS[ch] then
+              scored[#scored + 1] = { ch = ch, s = beam_char_score(ch, st.last, len) }
+            end
+          end
+          if #scored > 0 then
+            table.sort(scored, function(a, b)
+              if a.s ~= b.s then return a.s > b.s end
+              return a.ch < b.ch
+            end)
+            local layer = dp[i + len]
+            if not layer then layer = {}; dp[i + len] = layer end
+            for k = 1, math.min(3, #scored) do
+              local parts = {}
+              for _, p in ipairs(st.parts) do parts[#parts + 1] = p end
+              parts[#parts + 1] = sub
+              layer[#layer + 1] = {
+                score = st.score + scored[k].s,
+                parts = parts,
+                last = scored[k].ch,
+                text = (st.text or '') .. scored[k].ch,
+              }
+            end
+          end
+        end
+      end
+    end
+    ::continue::
+  end
+  if os.getenv('BEAMDBG') then
+    local layers = {}
+    for k = 0, L do layers[#layers + 1] = tostring(k) .. ':' .. tostring(dp[k] and #dp[k] or 0) end
+    io.stderr:write('BEAM L=' .. L .. ' ' .. table.concat(layers, ' ') .. '\n')
+  end
+  local final = dp[L]
+  if not final or #final == 0 then return nil end
+  table.sort(final, function(a, b) return a.score > b.score end)
+  return final[1]
+end
+
+local function emit_beam_sentence(code, seg, env)
+  if #code < 4 or code:find("?", 1, true) then return false end
+  local res = beam_parts(code, env)
+  if not res or #res.parts < 2 then return false end
+  -- ① beam 自己的字序列（切分 + 逐字打分的结果）
+  if res.text and res.text ~= '' then
+    yield(make_candidate('phrase', seg.start, seg._end, res.text, code))
+  end
+  -- ② 交给 decode_sentence 做词合并（可能给出更像词的切分）
+  local sent = decode_sentence(res.parts, env)
+  if sent and sent.text and sent.text ~= '' and sent.text ~= res.text then
+    yield(make_candidate('phrase', seg.start, seg._end, sent.text, code))
+  end
+  -- ③ 词前缀（可提前上屏）
+  if sent then
+    local offsets = compute_part_offsets(code)
+    local acc = ''
+    for idx, sg in ipairs(sent.segs) do
+      acc = acc .. sg.text
+      if idx < #sent.segs then
+        local st = offsets[sg.from] and offsets[sg.from].start or seg.start
+        local en = offsets[sg.to] and offsets[sg.to]._end or seg._end
+        yield(make_candidate('phrase', st, en, acc, code))
+      end
+    end
+  end
+  return true
+end
 
 -- 无分词「整句输入」：把连续笔画码自动切成 2~4 段（每段 1~6 位前缀），
 -- 用词组索引（phrase_stroke_index，键为「每段码 + '」）查词库，得到「我们」「我们的」等多字词。
@@ -2542,6 +2694,8 @@ local function translator_body(input, seg, env)
     -- 这里用去掉首尾分词符的副本判断，raw_input 仍用原串以保证候选偏移正确。
     local core = parse_input:gsub("'+$", "")
     if core:match("^[12345?]+$") then
+      -- 无分词整句：≥8 位的连续码先做 beam 切分 + 词合并，给整句候选
+      if BEAM_ENABLE and #core >= 8 then emit_beam_sentence(core, seg, env) end
       -- 整句输入：连续码自动组词（不打分词符也能出「我们」这类词）
       local has_exact = exact_stroke[core] and #exact_stroke[core] > 0
       if has_exact then
