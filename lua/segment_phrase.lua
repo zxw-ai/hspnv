@@ -1901,7 +1901,8 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2, last_done)
 
   -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
-  if sent and #sent.segs > 1 and not sent.weak then
+  -- 严格模式下不输出：这些是「N 字词」，违反「只出 N+1 字词」
+  if sent and #sent.segs > 1 and not sent.weak and not STRICT_SEGMENTS then
     local acc = ''
     for idx, sg in ipairs(sent.segs) do
       acc = acc .. sg.text
@@ -2044,8 +2045,8 @@ local function emit_beam_sentence(code, seg, env)
   if sent and sent.text and sent.text ~= '' and sent.text ~= res.text then
     yield(make_candidate('phrase', seg.start, seg._end, sent.text, code))
   end
-  -- ③ 词前缀（可提前上屏）
-  if sent then
+  -- ③ 词前缀（可提前上屏）：严格模式下不出
+  if sent and not STRICT_SEGMENTS then
     local offsets = compute_part_offsets(code)
     local acc = ''
     for idx, sg in ipairs(sent.segs) do
