@@ -44,9 +44,40 @@ function M.func(key_event, env)
   end)
   if not c1 then return 2 end
 
-  -- 唯一候选：直接提交（键道顶功原有行为）
+  -- 只允许「纯汉字」候选自动上屏：
+  -- 笔画方案里有几类候选绝不能自动上屏——
+  --   (1) 无效输入的兜底候选（如 4500 -> 「丶乛？？」）
+  --   (2) 预编辑用的符号串、分词符本身
+  -- 否则用户打个错码就会眼睁睁看它把符号串插进文本。
+  local function all_cjk(text)
+    if not text or text == '' then return false end
+    local i, n = 1, #text
+    while i <= n do
+      local b = text:byte(i)
+      local len = 1
+      if b >= 0xF0 then len = 4 elseif b >= 0xE0 then len = 3 elseif b >= 0xC0 then len = 2 end
+      if len ~= 3 then return false end          -- ASCII/2字节/4字节一律拒绝
+      local c1, c2_, c3 = text:byte(i, i + 2)
+      if not c1 or not c2_ or not c3 then return false end
+      local cp = (c1 - 0xE0) * 4096 + (c2_ - 0x80) * 64 + (c3 - 0x80)
+      if cp < 0x4E00 or cp > 0x9FFF then return false end   -- 只收基本汉字区
+      i = i + 3
+    end
+    return true
+  end
+
+  local function cand_text(c)
+    local t = nil
+    pcall(function() t = c.text end)
+    if not t then pcall(function() t = c:get_text() end) end
+    return t
+  end
+
+  -- 唯一候选：直接提交（键道顶功原有行为），但仅限纯汉字候选
   if not c2 then
-    pcall(function() ctx:commit() end)
+    if all_cjk(cand_text(c1)) then
+      pcall(function() ctx:commit() end)
+    end
     return 2
   end
 
@@ -76,7 +107,8 @@ function M.func(key_event, env)
 
   local info = nil
   pcall(function() info = segp.get_auto_select_first(input, env) end)
-  if info and info.text == c1.text and info.conf and info.conf >= threshold then
+  if info and info.text == cand_text(c1) and info.conf and info.conf >= threshold
+     and all_cjk(info.text) then
     -- 高置信首位：提交首位候选（正确文本，非原始输入码）
     pcall(function() ctx:commit() end)
   end

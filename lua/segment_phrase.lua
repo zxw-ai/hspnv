@@ -2868,10 +2868,15 @@ local function translator_body(input, seg, env)
   if parse_input == '' then parse_input = input end
 
   -- 情况 A: 刚按下分词符，末尾是 ' (例如 3121' 或 1324454' 或 31'32')
-  -- 立即触发高频连缀联想（不限字数，字词皆通）
+  -- 连缀联想只在「前面已经打完至少 2 段」时才做：
+  --   31'32'  → 已有一个两字词完整，可以联想后续（我们/我的…）
+  --   3'      → 才打了一笔，用户还在选第一个字，此时给「的我/的好」纯属干扰
+  --             应该退回单字候选
   if parse_input:sub(-1, -1) == "'" then
     local prefix_expr = parse_input:sub(1, -2)
-    if prefix_expr ~= "" and not prefix_expr:find("''", 1, true) then
+    local n_prefix_parts = 0
+    for _ in prefix_expr:gmatch("[^']+") do n_prefix_parts = n_prefix_parts + 1 end
+    if prefix_expr ~= "" and not prefix_expr:find("''", 1, true) and n_prefix_parts >= 2 then
       emit_open_continuation(prefix_expr, input, seg, env)
       -- 追加「前段词 + 末段单字」：连打/整句输入时可以随时先上屏前几个字
       local p_parts = {}
