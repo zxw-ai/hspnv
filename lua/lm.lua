@@ -42,6 +42,28 @@ function M.p_char_token(ch)
   return LOG10(f) - LOG10(token.total_chars)
 end
 
+-- 词频估算：各字 token 概率连乘 × 词频总量（用于校准词库里的「人造占位词频」）
+local expected_cache = {}
+function M.expected_freq(w)
+  if not w or w == '' then return 0 end
+  local cached = expected_cache[w]
+  if cached ~= nil then return cached end
+  ensure()
+  local v = 0
+  if token then
+    local p = 1
+    local ok = true
+    for ch in w:gmatch("[\1-\127\194-\244][\128-\191]*") do
+      local f = token.chars and token.chars[ch]
+      if not f or f <= 0 then ok = false break end
+      p = p * (f / token.total_chars)
+    end
+    if ok then v = p * token.total_words end
+  end
+  expected_cache[w] = v
+  return v
+end
+
 -- 字二元：log10 P(下一个字 | 上一个字)；没有记录返回 nil
 -- 默认关闭：数据 1.5MB、首次加载约 300ms，而实测在现有评测集上未见量化提升。
 -- 需要时把 schema 的 segment_phrase/char_bigram 改 true（会惰性加载 char_bigram.lua）。

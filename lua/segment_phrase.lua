@@ -1373,6 +1373,58 @@ local function decode_sentence(parts, env)
   return res
 end
 
+-- 词库权重校准（关键）：
+-- words.lua 与 phrase_stroke_index 里混着大量「人造占位值」——
+--   words: 1201 有 10 万条、20000 有 5085 条（各碗汤/每辆汽车/每段话…）
+--   psi  : 20000 有 67909 条（占 61%）、5000 有 16332 条
+-- 直接按这些值排序，合成词会顶掉真常用词，候选区看起来就是「乱的」。
+-- 这里用「字频连乘估算」做交叉校验：估算值极低（<200）说明这些字几乎不会
+-- 连在一起成词，判定为切分残留/合成词，把权重压到估算量级。
+local sf_cache = {}
+-- 虚词结尾惩罚：词库里大量「X+的」式切分残留（年的/看的/香的/记者的…），
+-- 它们字频估算很高（的和前面的字都常见），单靠估算压不下去，会把首页挤乱。
+-- 只保护真正的常用词（代词/常用形容+的）。
+-- 直接封顶（不用乘法：这些词的原始 sf 往往是虚高的占位值，乘法压不住）
+local WEAK_SUFFIX_CAP = { ['的'] = 1200, ['着'] = 1500, ['地'] = 1500, ['得'] = 1500, ['过'] = 1500 }
+local SUFFIX_WHITELIST = {
+  ['我的']=true, ['你的']=true, ['他的']=true, ['她的']=true, ['它的']=true, ['谁的']=true,
+  ['好的']=true, ['真的']=true, ['是的']=true, ['有的']=true, ['别的']=true, ['什么的']=true,
+  ['我们的']=true, ['你们的']=true, ['他们的']=true, ['她们的']=true,
+  ['目的']=true, ['标的']=true, ['标的物']=true, ['所得']=true, ['记得']=true, ['值得']=true,
+  ['觉得']=true, ['懂得']=true, ['显得']=true, ['晓得']=true,
+}
+local function weak_suffix_cap(w)
+  if SUFFIX_WHITELIST[w] then return nil end
+  local last_ch = w:match("([^\128-\191][\128-\191]*)$")
+  if last_ch and WEAK_SUFFIX_CAP[last_ch] then
+    local n = 0
+    for _ in w:gmatch("[\1-\127\194-\244][\128-\191]*") do n = n + 1 end
+    if n >= 2 then return WEAK_SUFFIX_CAP[last_ch] end
+  end
+  return nil
+end
+
+local function calib_sf(w, raw_sf)
+  raw_sf = raw_sf or 0
+  if raw_sf <= 0 then return 0 end
+  local est = sf_cache[w]
+  if est == nil then
+    if LM and LM.expected_freq then
+      local ok, v = pcall(LM.expected_freq, w)
+      est = (ok and v) or 0
+    else
+      est = 0
+    end
+    sf_cache[w] = est
+  end
+  if est > 0 and est < 200 then
+    return math.min(raw_sf, est * 10)
+  end
+  local cap = weak_suffix_cap(w)
+  if cap and raw_sf > cap then return cap end
+  return raw_sf
+end
+
 local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, full_len)
   -- 防爆上限：超过 MAX_WORD_LEN 的分词不再尝试匹配超长词（词库机构名等长词保留但不在此路径联想）
   if target_len > MAX_WORD_LEN then return end
@@ -1389,7 +1441,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     local cf = ngram.word_freq(last, w, env)
     local old = found[w]
     if not old or (exact and not old.exact) or ((uf * WORD_UF_STEP + cf) > (old.uf * WORD_UF_STEP + (old.cf or 0))) then
-      found[w] = {text = w, sf = sf or 0, uf = uf, cf = cf, exact = exact}
+      found[w] = {text = w, sf = calib_sf(w, sf), uf = uf, cf = cf, exact = exact}
     end
   end
 
@@ -1541,7 +1593,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     table.sort(items, function(a, b)
       local au, bu = learning.freq(a.text, env) + ngram.word_freq(last, a.text, env), learning.freq(b.text, env) + ngram.word_freq(last, b.text, env)
       if au ~= bu then return au > bu end
-      local as, bs = a.sf or 0, b.sf or 0
+      local as, bs = calib_sf(a.text, a.sf), calib_sf(b.text, b.sf)
       if as ~= bs then return as > bs end
       return (a.rank or 0) < (b.rank or 0)
     end)
@@ -1558,7 +1610,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   local WHOLE_FIRST = 5     -- 首页整词名额
   local WAITING_FIRST = 2   -- 首页前缀词名额
   local LAST_CHARS = 2      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
-  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete, sent_ok)
+  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete, sent_ok, last_done)
     local wholes = whole_phrases or {}
     local waits = waiting_items or {}
     local n_whole, n_wait = 0, 0
@@ -1570,6 +1622,18 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
       if SENTENCE_PUNCT then
         emit_candidate('phrase', sentence .. '。', seg_start, seg_end)
       end
+    end
+    -- 末段还没打完（码长 <3 或没精确命中）时，前缀词先上首页：
+    -- 用户打完前几段、第三个字才打一两笔，此刻最可能想「先上屏前面的词」，
+    -- 而不是在一堆勉强的 N 字词里找。打完（last_done）则整词优先。
+    -- 注意：有整句候选时不能抢首页（否则「我知道了」这类末字是两笔字的句子
+    -- 会因为 last_done=false 被前缀词挤到第 3、4 位）
+    if not last_done and #waits > 0 and not (sent_ok and sentence and sentence ~= '') then
+      local early = math.min(4, #waits)
+      for i = 1, early do
+        emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+      end
+      n_wait = early
     end
     -- 非置顶时，整句固定插在第 2 个整词之后（首页第 3 位），
     -- 避免被 5 个整词挤到首页末尾/第二页
@@ -1587,18 +1651,28 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     if sentence and sentence ~= '' and not last_complete and n_whole < 2 then
       emit_candidate('phrase', sentence, seg_start, seg_end)
     end
+    -- ② 其余整词：先把「N 字词」这一层全部铺满，候选区结构才不乱
+    for i = n_whole + 1, #wholes do
+      emit_candidate('phrase', wholes[i].text, seg_start, seg_end)
+    end
+    -- ② 前缀词（少一段的词，可提前上屏）：全部排在整词之后，自成一段
     for i, item in ipairs(waits) do
       if i > WAITING_FIRST then break end
       n_wait = i
       emit_candidate('phrase', item.text, item.s, item.e)
     end
-    -- 末段单字（码不完整也按前缀出字，保证随时能选字）
+    for i = n_wait + 1, #waits do
+      emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+    end
+    -- ③ 末段单字放最后：分词输入时用户要的是「词」，单字只是兜底
+    --    （必须输出，否则末段菜单元为空会让预编辑区回退显示原始数字）
     if #parts >= 1 then
       local last_off = offsets and offsets[#parts]
       local ls = last_off and last_off.start or seg_start
       local le = last_off and last_off._end or seg_end
       local clist = chars_for(parts[#parts], env)
-      local last_cap = (#wholes == 0) and 8 or LAST_CHARS
+      -- 整词/前缀词都不存在（纯兜底场景）时多给几个单字
+      local last_cap = (#wholes == 0 and #waits == 0) and 8 or LAST_CHARS
       local n = 0
       for _, item in ipairs(clist) do
         if n >= last_cap then break end
@@ -1606,14 +1680,6 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
           if emit_candidate('single', item.ch, ls, le) then n = n + 1 end
         end
       end
-    end
-    -- 其余整词
-    for i = n_whole + 1, #wholes do
-      emit_candidate('phrase', wholes[i].text, seg_start, seg_end)
-    end
-    -- 其余前缀词
-    for i = n_wait + 1, #waits do
-      emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
     end
   end
 
@@ -1699,7 +1765,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     -- 空整词分支同样支持「末段完整 → 整句置顶」（否则 4 段词库无组合时整句拿不到首位）
     local lpc2 = parts[#parts]
     local last_complete2 = lpc2 and #lpc2 >= 3 and exact_stroke[lpc2] ~= nil
-    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2, last_complete2, sent2 ~= nil and #sent2.segs >= 2)
+    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2, last_complete2, sent2 ~= nil and #sent2.segs >= 2, last_complete2)
 
     -- 3. 无整词时部分回退：保护前段词 + 末段按笔画重新定字（不再整串笔画兜底）
     local has_any = false
@@ -1710,10 +1776,18 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     return
   end
 
+  -- 统一校准：不管条目来自哪条路径（词组桶/首字桶/学习库/单字组合），
+  -- 排序前都按同一口径重算一次 sf，避免「有的校准了有的没校准」。
+  for w, item in pairs(found) do
+    item.sf = calib_sf(w, item.sf)
+    if not item.text then item.text = w end
+  end
+
   table.sort(order, function(a, b)
     if a.exact ~= b.exact then return a.exact end
     local au, bu = a.uf * WORD_UF_STEP + (a.cf or 0), b.uf * WORD_UF_STEP + (b.cf or 0)
     if au ~= bu then return au > bu end
+    -- 用校准后的 sf 排序（词库里 20000/1201 这类占位值会把合成词顶到前面）
     if a.sf ~= b.sf then return a.sf > b.sf end
     return a.text < b.text
   end)
@@ -1809,10 +1883,11 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   -- 末段「打完」的判定：完整码命中 且 码长 >=3（两笔字的完整码太多，
   -- 如 八=34、了几=52，会把还在输入中的情况误判成整句完成）
   local last_complete = last_part_code and #last_part_code >= 3 and exact_stroke[last_part_code] ~= nil
-  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2)
+  local last_done = last_complete
+  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2, last_done)
 
   -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
-  if sent and #sent.segs > 1 then
+  if sent and #sent.segs > 1 and not sent.weak then
     local acc = ''
     for idx, sg in ipairs(sent.segs) do
       acc = acc .. sg.text
@@ -2185,7 +2260,7 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
           for _ in w:gmatch("[\194-\244][\128-\191]*") do chs_n = chs_n + 1 end
           if chs_n == target_len then
             local uf = learning.freq(w, env)
-            found[w] = {sf = sf, uf = uf, cf = ngram.word_freq(last, w, env)}
+            found[w] = {sf = calib_sf(w, sf), uf = uf, cf = ngram.word_freq(last, w, env)}
           end
         end
       end
@@ -2195,7 +2270,7 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
           local chs_n = 0
           for _ in w:gmatch("[\194-\244][\128-\191]*") do chs_n = chs_n + 1 end
           if chs_n == target_len then
-            found[w] = {sf = sf, uf = uf, cf = ngram.word_freq(last, w, env)}
+            found[w] = {sf = calib_sf(w, sf), uf = uf, cf = ngram.word_freq(last, w, env)}
           end
         end
       end
@@ -2237,7 +2312,8 @@ local function emit_open_continuation(prefix_expr, raw_input, seg, env)
     local item_a, item_b = found[a], found[b]
     local au, bu = item_a.uf * WORD_UF_STEP + (item_a.cf or 0), item_b.uf * WORD_UF_STEP + (item_b.cf or 0)
     if au ~= bu then return au > bu end
-    if item_a.sf ~= item_b.sf then return item_a.sf > item_b.sf end
+    local as, bs = calib_sf(a, item_a.sf), calib_sf(b, item_b.sf)
+    if as ~= bs then return as > bs end
     return a < b
   end)
 
@@ -2378,7 +2454,7 @@ local function build_predict_continuations(env)
     if not w or w == '' then return end
     local old = found[w]
     if not old then
-      found[w] = { sf = wsf, uf = uf or 0, cf = cfv or 0 }
+      found[w] = { sf = calib_sf(w, wsf), uf = uf or 0, cf = cfv or 0 }
       return
     end
     if (wsf or 0) > (old.sf or 0) then old.sf = wsf end
