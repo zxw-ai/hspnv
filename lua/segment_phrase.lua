@@ -114,6 +114,7 @@ local CHAR_UF_STEP = WEIGHTS.char_uf_step
 local HEAD_WORDS_MAX = 30
 local LEARN_MAX = 20
 local PRE_RANK = 60
+local STRICT_SEGMENTS = true   -- 严格按段数出词：N 个分词符 → 只出 N+1 字词（不掺前缀词）
 local SENTENCE_PUNCT = true      -- 整句置顶时，追加一个带句号的变体（写句子场景）
 local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
 local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
@@ -154,6 +155,8 @@ local function load_settings(env)
     if time_context then
       local mo = cfg:get_int('segment_phrase/max_output')
     if mo and mo > 0 then MAX_OUTPUT = mo end
+    local ss = cfg:get_bool('segment_phrase/strict_by_segments')
+    if ss ~= nil then STRICT_SEGMENTS = ss end
     local sp_ = cfg:get_bool('segment_phrase/sentence_punct')
     if sp_ ~= nil then SENTENCE_PUNCT = sp_ end
     local te = cfg:get_bool('segment_phrase/time_context')
@@ -1623,17 +1626,17 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
         emit_candidate('phrase', sentence .. '。', seg_start, seg_end)
       end
     end
-    -- 末段还没打完（码长 <3 或没精确命中）时，前缀词先上首页：
-    -- 用户打完前几段、第三个字才打一两笔，此刻最可能想「先上屏前面的词」，
-    -- 而不是在一堆勉强的 N 字词里找。打完（last_done）则整词优先。
-    -- 注意：有整句候选时不能抢首页（否则「我知道了」这类末字是两笔字的句子
-    -- 会因为 last_done=false 被前缀词挤到第 3、4 位）
-    if not last_done and #waits > 0 and not (sent_ok and sentence and sentence ~= '') then
-      local early = math.min(4, #waits)
-      for i = 1, early do
-        emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+    -- 严格按段数模式（strict_by_segments，默认开）：
+    --   只输出「N+1 字词」（覆盖全部输入）+「末段单字」（兜底，避免菜单元为空）。
+    --   不再输出前缀词——不同长度的前缀词混在一起，正是候选区乱的根源。
+    if not STRICT_SEGMENTS then
+      if not last_done and #waits > 0 and not (sent_ok and sentence and sentence ~= '') then
+        local early = math.min(4, #waits)
+        for i = 1, early do
+          emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+        end
+        n_wait = early
       end
-      n_wait = early
     end
     -- 非置顶时，整句固定插在第 2 个整词之后（首页第 3 位），
     -- 避免被 5 个整词挤到首页末尾/第二页
@@ -1655,14 +1658,16 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     for i = n_whole + 1, #wholes do
       emit_candidate('phrase', wholes[i].text, seg_start, seg_end)
     end
-    -- ② 前缀词（少一段的词，可提前上屏）：全部排在整词之后，自成一段
-    for i, item in ipairs(waits) do
-      if i > WAITING_FIRST then break end
-      n_wait = i
-      emit_candidate('phrase', item.text, item.s, item.e)
-    end
-    for i = n_wait + 1, #waits do
-      emit_candidate('phrase', waits[i].text, waits[i].s, waits[i].e)
+    -- ② 前缀词（少一段的词，可提前上屏）：严格模式下完全不出
+    if not STRICT_SEGMENTS then
+      for i, item in ipairs(waits) do
+        if i > WAITING_FIRST then break end
+        n_wait = i
+        emit_candidate('phrase', item.text, item.s, item.e)
+      end
+      for i = n_wait + 1, #waits do
+        emit_candidate('phrase', item.text, item.s, item.e)
+      end
     end
     -- ③ 末段单字放最后：分词输入时用户要的是「词」，单字只是兜底
     --    （必须输出，否则末段菜单元为空会让预编辑区回退显示原始数字）
@@ -1671,8 +1676,15 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
       local ls = last_off and last_off.start or seg_start
       local le = last_off and last_off._end or seg_end
       local clist = chars_for(parts[#parts], env)
-      -- 整词/前缀词都不存在（纯兜底场景）时多给几个单字
-      local last_cap = (#wholes == 0 and #waits == 0) and 8 or LAST_CHARS
+      -- 单字名额动态：
+      --   整词很少（如 4 字词池只有 2 个）→ 多给单字把首页补满，避免候选区空荡荡
+      --   整词充足 → 只给 LAST_CHARS 个（用户要的是词，不是字）
+      local last_cap = LAST_CHARS
+      if #wholes < 9 then
+        local need = 9 - #wholes - (sent_ok and sentence and sentence ~= '' and 2 or 0)
+        if need > last_cap then last_cap = need end
+        if last_cap > 12 then last_cap = 12 end
+      end
       local n = 0
       for _, item in ipairs(clist) do
         if n >= last_cap then break end
@@ -2926,10 +2938,10 @@ local function translator_body(input, seg, env)
       if has_exact or #core <= 4 then
         -- 整串恰好是某个字的完整码：单字优先，词随后
         emit_single(core, seg, env)
-        emit_auto_words(core, seg, env)
+        if not STRICT_SEGMENTS then emit_auto_words(core, seg, env) end
       else
         -- 整串不是一个字：自动组词优先（这才是「整句输入」想要的结果）
-        emit_auto_words(core, seg, env)
+        if not STRICT_SEGMENTS then emit_auto_words(core, seg, env) end
         emit_single(core, seg, env)
       end
       return
