@@ -1461,7 +1461,11 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
   end
   -- 2. 词组切片桶：按「每字笔画前缀」直接命中词库词组（任意字数，分词后第一优先级，LRU 缓存）
-  local slice_hits = slice_phrase_bucket(parts)
+  --    两段且每段都是短码（≤2 位）时跳过 slice：psi 已精确命中前两笔简码
+  --    （如 34'11 → 今天/公元/公开/全球），slice 再兜底会塞进「公式/合理/人形」这类
+  --    大范围前缀词，把候选撑到 60 个、拖慢到 450ms。三字以上仍需 slice（psi 命中往往只有 1 个）。
+  local two_short = (#parts == 2 and #parts[1] <= 2 and #parts[2] <= 2)
+  local slice_hits = two_short and {} or slice_phrase_bucket(parts)
   if #slice_hits > 0 then
     has_phrase = true
     for _, w in ipairs(slice_hits) do
@@ -1470,6 +1474,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   end
 
   -- 3. 用户自造/已学词库注入（上屏学习后始终参与召回，权重按 learning 频次排序）
+  --    全段短码时同样跳过（理由同上）。
   -- 首字必须匹配 parts[1]：先取该段可能的字，再只查这些字的桶
   local first_cands = {}
   for _, ch in ipairs((function()
@@ -2910,6 +2915,9 @@ local function translator_body(input, seg, env)
           qc_emitted[w] = true
           yield(make_candidate('phrase', seg.start, seg._end, w, input))
         end
+        -- 简码是用户主动背的码：命中就只出简码词，不再追加分词/前缀结果
+        --（否则 1'4'3'1 会混入「一部手机/两头白面」这类量词短语，还拖慢到 465ms）
+        return
       end
     end
 
