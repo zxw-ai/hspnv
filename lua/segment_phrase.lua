@@ -114,8 +114,8 @@ local CHAR_UF_STEP = WEIGHTS.char_uf_step
 local HEAD_WORDS_MAX = 30
 local LEARN_MAX = 20
 local PRE_RANK = 60
-local STRICT_SEGMENTS = true
-local qc_emitted = {}   -- 本次输入简码已输出的词（避免与分词结果重复）   -- 严格按段数出词：N 个分词符 → 只出 N+1 字词（不掺前缀词）
+local STRICT_SEGMENTS = true   -- 严格按段数出词
+local qc_emitted = {}   -- 本次输入简码已输出的词（在 add_cand 层去重，避免与分词结果重复）：N 个分词符 → 只出 N+1 字词（不掺前缀词）
 local SENTENCE_PUNCT = true      -- 整句置顶时，追加一个带句号的变体（写句子场景）
 local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
 local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
@@ -1461,11 +1461,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
   end
   -- 2. 词组切片桶：按「每字笔画前缀」直接命中词库词组（任意字数，分词后第一优先级，LRU 缓存）
-  --    两段且每段都是短码（≤2 位）时跳过 slice：psi 已精确命中前两笔简码
-  --    （如 34'11 → 今天/公元/公开/全球），slice 再兜底会塞进「公式/合理/人形」这类
-  --    大范围前缀词，把候选撑到 60 个、拖慢到 450ms。三字以上仍需 slice（psi 命中往往只有 1 个）。
-  local two_short = (#parts == 2 and #parts[1] <= 2 and #parts[2] <= 2)
-  local slice_hits = two_short and {} or slice_phrase_bucket(parts)
+  local slice_hits = slice_phrase_bucket(parts)
   if #slice_hits > 0 then
     has_phrase = true
     for _, w in ipairs(slice_hits) do
@@ -1474,7 +1470,6 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   end
 
   -- 3. 用户自造/已学词库注入（上屏学习后始终参与召回，权重按 learning 频次排序）
-  --    全段短码时同样跳过（理由同上）。
   -- 首字必须匹配 parts[1]：先取该段可能的字，再只查这些字的桶
   local first_cands = {}
   for _, ch in ipairs((function()
@@ -1795,15 +1790,11 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     return
   end
 
-  -- 统一处理：① 简码已输出的词去重；② 不管条目来自哪条路径，
+  -- 统一校准：不管条目来自哪条路径（词组桶/首字桶/学习库/单字组合），
   -- 排序前都按同一口径重算一次 sf，避免「有的校准了有的没校准」。
   for w, item in pairs(found) do
-    if qc_emitted[w] then
-      found[w] = nil
-    else
-      item.sf = calib_sf(w, item.sf)
-      if not item.text then item.text = w end
-    end
+    item.sf = calib_sf(w, item.sf)
+    if not item.text then item.text = w end
   end
 
   table.sort(order, function(a, b)
@@ -2760,7 +2751,7 @@ end
 
 local function translator_body(input, seg, env)
   if not seg or seg.start == nil or seg._end == nil then return end
-  qc_emitted = {}   -- 每次输入清空简码去重集合
+  qc_emitted = {}   -- 每次输入清空简码去重集合（Lua table，安全）
   if input and input:sub(1, 1) == 'V' then return end
   -- 纯字母输入（拼音反查）：交给 pinyin_reverse translator，本翻译器不输出笔画符号兜底
   if input and input:match("^[a-z]+$") then return end
@@ -2915,8 +2906,8 @@ local function translator_body(input, seg, env)
           qc_emitted[w] = true
           yield(make_candidate('phrase', seg.start, seg._end, w, input))
         end
-        -- 简码是用户主动背的码：命中就只出简码词，不再追加分词/前缀结果
-        --（否则 1'4'3'1 会混入「一部手机/两头白面」这类量词短语，还拖慢到 465ms）
+        -- 简码是用户主动背的码：命中就只出简码词，直接返回（纯 Lua，不碰 yield 包装）。
+        -- 否则分词结果会重复输出「现在/我们」，还混入「一部手机」噪音 + 拖到 465ms。
         return
       end
     end
@@ -2991,21 +2982,11 @@ end
 local function translator(input, seg, env)
   local n = 0
   local orig_yield = yield
-  -- 最终去重：不管候选来自哪条路径（简码/分词/前缀/兜底），
-  -- 同一「文本+跨度」只输出一次（简码与分词结果会重复，之前出现过「现在/我们」各两次）
-  local yielded = {}
-  local function do_yield(c)
-    local key = (c.text or '') .. '\0' .. tostring(c.start or '') .. '\0' .. tostring(c._end or '')
-    if yielded[key] then return end
-    yielded[key] = true
-    n = n + 1
-    orig_yield(c)
-  end
   -- 动态候选上限（结束后恢复，避免影响其他调用）
   local saved_cap = MAX_OUTPUT
   MAX_OUTPUT = dynamic_cap(input)
-  -- 用带最终去重的 do_yield 替换全局 yield
-  yield = do_yield
+  -- 计数包装（仅为了诊断日志；yield 是 librime-lua 注入的全局函数）
+  yield = function(c) n = n + 1; orig_yield(c) end
   local ok, err = pcall(translator_body, input, seg, env)
   MAX_OUTPUT = saved_cap
   yield = orig_yield
