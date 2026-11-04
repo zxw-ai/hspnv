@@ -119,6 +119,15 @@ local qc_emitted = {}   -- 本次输入简码已输出的词（在 add_cand 层�
 local SENTENCE_PUNCT = true      -- 整句置顶时，追加一个带句号的变体（写句子场景）
 local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
 local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
+-- 顶功防误判：本前缀「还能继续打笔」的延长字，是否计入置信度分母。
+-- 只在延长字里有「比当前精确字常用 100 倍」的超高频字时才抑制（如 3121 是「我」的前缀，
+-- 而「壬」只有 2 万字频 → 不能顶功上屏「壬」）；否则不影响（如 1234→木 正常顶功）。
+local PREFIX_EXT_ON = true
+local PREFIX_EXT_RATIO = 100     -- 延长字要超过精确字 100 倍才抑制
+local PREFIX_EXT_DISCOUNT = 0.5  -- 抑制时延长字权重打对折
+-- 按分词键（末尾 '）后的「N+1 字词联想」条数上限（移植自 qwen 的 open_continuation_max）：
+-- 铺满会让「前缀词 + 末段单字」翻到后面，用户刚打完的那个字反而找不回来。
+local OPEN_CONT_MAX = 3
 local PREDICT_MAX = 8       -- 空输入联想候选数（menu/page_size 一页 9 个，留 1 位给 predict_next 混合候选）
 local GRAM_ENABLE = false
 local GRAM_WEIGHT = 60000
@@ -164,6 +173,10 @@ local function load_settings(env)
       local tw = cfg:get_int('segment_phrase/time_weight')
       time_context.configure(te, tw)
     end
+    local ocm = cfg:get_int('segment_phrase/open_continuation_max')
+    if ocm and ocm >= 0 then OPEN_CONT_MAX = ocm end
+    local cpe = cfg:get_bool('auto_commit/consider_prefix_extension')
+    if cpe ~= nil then PREFIX_EXT_ON = cpe end
     local shf = cfg:get_int('segment_phrase/short_head_freeze')
     if shf and shf >= 0 then SHORT_HEAD_FREEZE = shf end
     local sub = cfg:get_int('segment_phrase/short_uf_boost')
@@ -257,6 +270,40 @@ end
 local function fuzzy_code(s)
   if not fuzzy_stroke_on then return s end
   return s:gsub("[25]", "X")
+end
+
+-- 学习字前缀缓存（移植自 hspnv-gram-qwen）：
+-- 原来 chars_for 每次都 `for ch in pairs(learning.all_chars(env))` 全表扫描，
+-- 3 万条学习库时每键几十毫秒。这里按「前缀」缓存结果，学习库变动时整体失效。
+local learned_prefix_cache, learned_prefix_cache_n = {}, 0
+local learned_prefix_rev = -1
+local LEARNED_PREFIX_CACHE_MAX = 256
+local function learned_chars_with_prefix(seg, env)
+  local rev = (learning.revision and learning.revision()) or 0
+  if rev ~= learned_prefix_rev then
+    learned_prefix_cache, learned_prefix_cache_n = {}, 0
+    learned_prefix_rev = rev
+  end
+  local key = (fuzzy_stroke_on and 'F' or 'S') .. seg
+  local hit = learned_prefix_cache[key]
+  if hit then return hit end
+  local out = {}
+  local target = fuzzy_code(seg)
+  for ch in pairs(learning.all_chars(env)) do
+    local code = stroke[ch]
+    if code then
+      local fc = fuzzy_code(code)
+      if fc == target or fc:sub(1, #target) == target then
+        out[#out + 1] = { ch = ch, exact = (fc == target) }
+      end
+    end
+  end
+  if learned_prefix_cache_n >= LEARNED_PREFIX_CACHE_MAX then
+    learned_prefix_cache, learned_prefix_cache_n = {}, 0
+  end
+  learned_prefix_cache[key] = out
+  learned_prefix_cache_n = learned_prefix_cache_n + 1
+  return out
 end
 
 -- =============================================================================
@@ -872,11 +919,9 @@ local function chars_for(seg, env)
   end
 
   -- 2. 注入用户在当前前缀下学习过的字（上屏频次优先）
-  for ch, cnt in pairs(learning.all_chars(env)) do
-    local code = stroke[ch]
-    if code and (fuzzy_code(code) == fuzzy_code(seg) or fuzzy_code(code):sub(1, #seg) == fuzzy_code(seg)) then
-      add_char(ch, fuzzy_code(code) == fuzzy_code(seg), 0)
-    end
+  --    用前缀缓存避免每次全表扫描 learning.all_chars（3 万条时是主要开销）
+  for _, hit in ipairs(learned_chars_with_prefix(seg, env)) do
+    add_char(hit.ch, hit.exact, 0)
   end
 
   -- 3. Trie 增量桶（主索引）：按词频排序的完整切片，任何中间笔顺和低频常用字都能命中！
@@ -1213,11 +1258,34 @@ end
 --     score(词) = log10 P(w) + W_CTX * log10(P(w|prev)/均匀) + W_UF * log10(1+uf)
 --     score(字) = log10 P(ch) + W_CTX * ctx(ch) + W_UF * log10(1+uf)
 --   这样「拆成单字」与「合成一个词」的比较等价于 PMI 判断，不再靠常数硬凑。
+-- ── 异常日志（移植自 hspnv-gram-qwen）────────────────────────────────────────
+-- 被 pcall 吞掉的异常是本方案最难排查的一类故障：候选凭空变少，界面却没有任何提示。
+-- 这里把每种异常只记录一次（全 session 最多 20 条）到 bg5_error.log，方便事后定位。
+local reported_errors, n_reported_errors = {}, 0
+local function record_error(err)
+  local msg = tostring(err)
+  if reported_errors[msg] or n_reported_errors >= 20 then return end
+  reported_errors[msg] = true
+  n_reported_errors = n_reported_errors + 1
+  local ok_dir, d = pcall(function()
+    return (rime_api and rime_api.get_user_data_dir and rime_api:get_user_data_dir()) or '.'
+  end)
+  if not ok_dir or not d then d = '.' end
+  local ok_open, f = pcall(io.open, d .. '/bg5_error.log', 'a')
+  if not ok_open or not f then return end
+  pcall(function()
+    f:write(string.format('%s\t%s\n', os.date('%H:%M:%S'), msg))
+    f:close()
+  end)
+end
+
 local LM = nil
-pcall(function() LM = require('lm') end)
+local ok_lm, lm_mod = pcall(require, 'lm')
+if ok_lm then LM = lm_mod else record_error('lm 模块加载失败，整句概率打分退化为常数: ' .. tostring(lm_mod)) end
 local LM_CTX_W = 0.7
 local LM_UF_W = 0.15
 local LM_LEN_BONUS = 0.30   -- 每多一个字成词的最小长度先验（倾向成词，但可被概率否决）
+local LM_EXACT_BONUS = 1.0  -- 词内每个字的完整码正好等于对应各段时的整码先验（移植自 qwen）
 local LOG10 = math.log10
 
 local function lm_ctx(prev_word, w, env)
@@ -1304,6 +1372,53 @@ local function decode_sentence(parts, env)
     for i = 1, math.min(#cands, limit or 2) do out[i] = cands[i] end
     return out
   end
+  -- 用户自造词跨度补全（移植自 hspnv-gram-qwen）：
+  -- phrase_stroke_index 由主词典生成，缺「手机 / 天气 / 见面」这类常用词（实测 26 个常用词里 7 个查不到），
+  -- DP 只查索引就会把它们硬拆成单字。这里用「每段候选字的笛卡尔积」按跨度补词，
+  -- 但**只接受用户真正上屏过的词**（learning.freq >= 3）。
+  -- 为什么不用 words.lua 补：它的频次是「档位」（1201/1501/1801/2001）而不是真实计数，
+  -- 任何二字词的 logP 都比拆成两个单字高约 2 个 log 单位，拿词典档补跨度会把正确切分抢掉
+  -- （qwen 实测「我们明天上午见」→「我们明天上手见」，关闭词典跨度后长句 5/6→6/6）。
+  -- 每跨度最多 3^3=27 次查表（4 字词降到 2^4=16），结果有本次调用内的缓存，不新增常驻表。
+  local span_word_cache = {}
+  local function span_words(from, to)
+    local ck = from * 100 + to
+    local cached = span_word_cache[ck]
+    if cached then return cached end
+    local res, combo = {}, {}
+    local lists = {}
+    local k = to - from + 1
+    local per = k >= 4 and 2 or 3
+    for j = from, to do lists[j - from + 1] = top_chars(parts[j], per) end
+    local function dfs(depth, txt)
+      if depth > k then
+        local freq = learning.freq(txt, env)
+        if freq and freq >= 3 then
+          local all_exact = true
+          for j = 1, k do
+            if stroke[combo[j]] ~= parts[from + j - 1] then all_exact = false break end
+          end
+          res[#res + 1] = { w = txt, freq = freq, exact = all_exact }
+        end
+        return
+      end
+      for _, ch in ipairs(lists[depth]) do
+        combo[depth] = ch
+        dfs(depth + 1, txt .. ch)
+      end
+    end
+    dfs(1, '')
+    table.sort(res, function(a, b)
+      if a.exact ~= b.exact then return a.exact end
+      local sa, sb = lm_word_score(a.w, env, a.freq), lm_word_score(b.w, env, b.freq)
+      if sa ~= sb then return sa > sb end
+      return a.w < b.w
+    end)
+    for i = 5, #res do res[i] = nil end
+    span_word_cache[ck] = res
+    return res
+  end
+
   for i = 1, n do
     local cur = nil
     for k = 1, math.min(4, i) do
@@ -1322,11 +1437,27 @@ local function decode_sentence(parts, env)
           local key = {}
           for j = i - k + 1, i do key[#key + 1] = parts[j] end
           local list = phrase_stroke_index[table.concat(key, "'")]
+          local added, n_added = {}, 0
           if list then
             for idx = 1, math.min(#list, 2) do
               local w = list[idx][1]
               if w and w ~= '' then
-                vec[#vec + 1] = { text = w, score = lm_word_score(w, env, list[idx][2]) + LM_CTX_W * lm_ctx(prev.last_word, w, env) + LM_LEN_BONUS * (k - 1) }
+                added[w] = true
+                n_added = n_added + 1
+                -- 索引命中即「词内每字完整码正好等于对应段」，享受整码先验
+                vec[#vec + 1] = { text = w, score = lm_word_score(w, env, list[idx][2]) + LM_CTX_W * lm_ctx(prev.last_word, w, env) + LM_LEN_BONUS * (k - 1) + LM_EXACT_BONUS * k }
+              end
+            end
+          end
+          if n_added < 2 then
+            -- 索引已给满 2 个词时不做笛卡尔积补全（省掉每键几十次哈希查表）
+            for _, hit in ipairs(span_words(i - k + 1, i)) do
+              if n_added >= 2 then break end
+              if not added[hit.w] then
+                added[hit.w] = true
+                n_added = n_added + 1
+                local bonus = hit.exact and LM_EXACT_BONUS * k or 0
+                vec[#vec + 1] = { text = hit.w, score = lm_word_score(hit.w, env, hit.freq) + LM_CTX_W * lm_ctx(prev.last_word, hit.w, env) + LM_LEN_BONUS * (k - 1) + bonus }
               end
             end
           end
@@ -2165,7 +2296,8 @@ local function emit_partial_escape(parts, raw_input, seg, env)
   local fast = phrase_stroke_index[key]
   local n_phrase = 0
   if fast then
-    for i = 1, math.min(#fast, 3) do
+    for i = 1, math.min(#fast, OPEN_CONT_MAX) do
+      if i > OPEN_CONT_MAX then break end
       emit_phrase(fast[i][1])
       n_phrase = n_phrase + 1
     end
@@ -3016,6 +3148,7 @@ local function translator(input, seg, env)
   local ok, err = pcall(translator_body, input, seg, env)
   MAX_OUTPUT = saved_cap
   yield = orig_yield
+  if not ok then record_error(err) end
   if not ok and seg and seg.start ~= nil and seg._end ~= nil then
     pcall(function()
       yield(make_candidate('stroke_fallback', seg.start, seg._end, to_stroke_symbol(input or ''), input or ''))
@@ -3051,21 +3184,55 @@ end
 M.get_auto_select_first = function(input, env)
   load_settings(env)
   if not input or input == '' then return nil end
+  -- 短码（<=2 笔）不参与顶功：用户还在选字，绝不能替他做决定
+  if #input < 3 then return nil end
   if not input:match("^[12345]+$") then return nil end
   local chars = chars_for(input, env)
   if not chars or #chars == 0 then return nil end
+  local function weight_of(ch)
+    return (learning.freq(ch, env) or 0) * CHAR_UF_STEP + (char_freq[ch] or 0)
+  end
   local first = nil
   local total = 0
+  local counted = {}
   for _, item in ipairs(chars) do
     if item.exact and not item.component and not item.stroke_symbol then
-      local w = (learning.freq(item.ch, env) or 0) * CHAR_UF_STEP + (char_freq[item.ch] or 0)
+      local w = weight_of(item.ch)
       total = total + w
-      if not first then
-        first = { text = item.ch, w = w }
-      end
+      counted[item.ch] = true
+      if not first then first = { text = item.ch, w = w } end
     end
   end
   if not first or total <= 0 then return nil end
+
+  -- 顶功防误判（移植自 hspnv-gram-qwen）：
+  -- 本前缀下还有「更长的码」的字（如 3121 是「我」=3121534 的前缀），
+  -- 若其中最常用的字比当前精确字常用 100 倍以上，说明用户多半还在打更长的字，
+  -- 此时把延长字计入分母，置信度自然降到阈值以下，不顶功。
+  -- 阈值用「最大值 / 精确字权重」而不是「总和 / 精确字权重」：
+  --   3121 → 我(31750万) / 壬(2万) = 15875 倍 → 抑制（避免把「壬」顶出去）
+  --   1234 → 想(16802万) / 木(362万) = 46 倍 → 不抑制（「木」正常顶功）
+  --   3445 → 令(1006万) / 今(762万) = 1.3 倍 → 不抑制
+  if PREFIX_EXT_ON then
+    local max_ext = 0
+    local ext_sum = 0
+    for _, item in ipairs(chars) do
+      local ch = item.ch
+      if not counted[ch] and not item.component and not item.stroke_symbol then
+        local code = stroke[ch]
+        -- 必须是「本输入的延长」（纠错候选、index 兜底项不是本前缀的字，不能计入）
+        if code and #code > #input and code:sub(1, #input) == input then
+          local w = weight_of(ch)
+          ext_sum = ext_sum + w
+          if w > max_ext then max_ext = w end
+          counted[ch] = true
+        end
+      end
+    end
+    if max_ext > first.w * PREFIX_EXT_RATIO then
+      total = total + PREFIX_EXT_DISCOUNT * ext_sum
+    end
+  end
   return { text = first.text, conf = first.w / total }
 end
 return M

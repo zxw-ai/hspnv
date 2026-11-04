@@ -201,6 +201,7 @@ segment_phrase:
   char_uf_step: 100000  # 单字候选排序：用户上屏 1 次 ≈ 静态字频 100000
   max_output: 60        # 候选总数上限（60 ≈ 7 页；调小可减少翻页负担）
   reorder_tolerance: true  # 相邻两笔顺序颠倒容错（如 木 1234 打成 1243 也能出）
+  open_continuation_max: 3  # 按分词键后的 N+1 字词联想条数上限（铺满会把当前字挤到后面）
   strict_by_segments: true  # 严格按段数出词：N 个分词符 → 只出 N+1 字词（不掺前缀词、无分词不出词）
   sentence_punct: true  # 整句置顶时追加「整句+句号」变体
   time_context: true    # 时段感知：早/中/晚/深夜给相关词加分（只在无强上下文时生效）
@@ -296,6 +297,10 @@ auto_commit:
   enable: true
   high_conf: true            # 高置信首位自动上屏总开关
   high_conf_threshold: 0.8  # 首位置信度阈值（0~1，越大越保守，误上屏越少）
+  # 置信度分母是否计入「本前缀继续打笔会出现的更长码字」。
+  # 只在延长字比当前字常用 100 倍以上时才抑制（如 3121 是「我」的前缀，壬只有 2 万字频
+  # → 不顶功上屏「壬」）；1234→木、3445→今 照常顶功。关掉会回到「打一半就把中间字顶出去」。
+  consider_prefix_extension: true
 
 # 连打键上屏联想词（移植自万象 enable_predict_space 机制；连打键默认 Tab，皮肤第3行表情键发送）
 predict_space:
