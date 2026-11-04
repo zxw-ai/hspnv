@@ -840,17 +840,32 @@ local function chars_for(seg, env)
     end
   end
 
-  -- 1.5 局部纠错候选（路线3）：易混笔画单位置替换的精确命中字，作为补充
-  -- rank=1500：精确(0) < 纠错(1500) < 普通前缀桶(2000+)，精确码永远优先。
-  -- 首两笔选字优化：短码（<=2笔）时跳过纠错，避免 44 -> 人/入/八/又 等非前缀字抢位，
-  -- 让前缀桶的「以该两笔开头」常用字直接顶格（配合《首两笔速查手册》）。
+  -- 1.5 局部纠错候选（路线3）：易混笔画单位置替换的精确命中字，作为「补充」。
+  -- rank 必须排在 Trie 前缀桶之后（桶是 2001+，纠错用 6000）：
+  --   旧值 1500 会让纠错字抢在「以该码开头」的真实字前面 —— 输入 3553（饭 的前缀）
+  --   会得到「仂 仍 凤 分 勼 勾」，因为它们是 3253/3554/3453 等纠错变体码的字，
+  --   把前缀桶里的「饭 饮 饿」挤到了第 10 位之后。
+  --   精确(0) < 前缀桶(2001+) < 纠错补充(6000) 才是正确优先级。
+  -- 短码（<=2笔）仍然跳过纠错（保护《首两笔速查》）。
   if correction_stroke_on and #seg > 2 then
+    -- 自适应优先级：看「前缀桶里最常用的字」有多常用。
+    --   桶里有常用字（如 3553 → 饭 449万）→ 说明用户打的就是这个前缀，纠错靠后(6000)
+    --   桶里全是生僻字（如 1243 → 丧 51万/啬 11万）→ 用户多半笔顺写错了，纠错提前(1500)
+    -- 这样 3553 出「饭」、1243 出「木」，两个场景都对。
+    local CORR_PROMOTE_CF = 1000000
+    local bucket_peak = 0
+    local pre_bucket = get_bucket(seg)
+    for i = 1, math.min(#pre_bucket, 20) do
+      local c = char_freq[pre_bucket[i]] or 0
+      if c > bucket_peak then bucket_peak = c end
+    end
+    local corr_rank = (bucket_peak < CORR_PROMOTE_CF) and 1500 or 6000
     local variants = correction_variants(seg)
     for _, var in ipairs(variants) do
       local corr_list = exact_stroke[var]
       if corr_list then
         for _, ch in ipairs(corr_list) do
-          add_char(ch, false, 1500)
+          add_char(ch, false, corr_rank)
         end
       end
     end
@@ -866,6 +881,11 @@ local function chars_for(seg, env)
 
   -- 3. Trie 增量桶（主索引）：按词频排序的完整切片，任何中间笔顺和低频常用字都能命中！
   local bucket = get_bucket(seg)
+  if os.getenv('BKDBG') then
+    local t = {}
+    for i=1,math.min(#bucket,12) do t[i]=bucket[i] end
+    io.stderr:write(string.format('BK seg=%s n=%d: %s\n', seg, #bucket, table.concat(t,' ')))
+  end
   if bucket then
     for i, ch in ipairs(bucket) do
       if i > MAX_PREFIX then break end
