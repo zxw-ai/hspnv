@@ -16,6 +16,7 @@ local tri_data = {}     -- 前二词..'\t'..前词..'\t'..后词 -> 次数（用
 local data_ts, char_ts, tri_ts = {}, {}, {}
 -- 个人语料种子（只读）：与用户实时学习分开存放，避免被写回用户文件
 local seed_data, seed_char, seed_tri = {}, {}, {}
+local WORD_SEED_SCALE = 100   -- 个人语料种子权重缩放：语料出现 1 次 ≈ 100 分（联想/整句 DP 可用）
 local by_prev = {}      -- 前词 -> {后词=次数} 索引（next_words 免全表遍历，长期使用性能优化）
 local by_prev_total = {} -- 前词 -> 总次数（条件概率 P(w|prev) 的分母）
 local by_prev2 = {}     -- 前二词..'\t'..前词 -> {后词=次数}（next_words3 索引）
@@ -252,7 +253,15 @@ function M.word_freq(prev, w, env)
   load(env)
   if not ENABLED or not prev or prev == '' or not w or w == '' then return 0 end
   local k = prev .. '\t' .. w
-  local n = data[k] or seed_data[k]
+  local n = data[k]
+  if not n then
+    local sn = seed_data[k]
+    if sn then
+      -- 种子条目按 word_weight 缩放：语料出现 1 次 ≈ 用户上屏 1 次的
+      -- WORD_SEED_SCALE 比例，让联想/整句 DP 能吃到与用户数据同量级的分
+      n = math.floor(sn * WORD_SEED_SCALE)
+    end
+  end
   if n then
     local f = 1
     local ts = data_ts[k]
