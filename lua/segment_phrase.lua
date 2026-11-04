@@ -116,7 +116,7 @@ local LEARN_MAX = 20
 local PRE_RANK = 60
 local STRICT_SEGMENTS = true   -- 严格按段数出词
 local qc_emitted = {}   -- 本次输入简码已输出的词（在 add_cand 层去重，避免与分词结果重复）：N 个分词符 → 只出 N+1 字词（不掺前缀词）
-local SENTENCE_PUNCT = true      -- 整句置顶时，追加一个带句号的变体（写句子场景）
+local SENTENCE_PUNCT = false  -- 整句带句号变体：默认关闭（它会比「段数=字数」多一个字符，破坏严格规则）      -- 整句置顶时，追加一个带句号的变体（写句子场景）
 local SHORT_HEAD_FREEZE = 2      -- 短码（1~2 笔）候选：前 N 位冻结，保住《首两笔速查》顺序
 local SHORT_UF_BOOST = 40000000  -- 短码候选：第 N+1 位起，用户上屏 1 次 ≈ 静态字频 4000 万
 -- 顶功防误判：本前缀「还能继续打笔」的延长字，是否计入置信度分母。
@@ -1020,18 +1020,32 @@ local function emit_single(input, seg, env)
     end
   end
 
-  -- 首两笔选字优化：短码（<=2笔）时不再把精确命中字顶格，
-  -- 直接按 chars_for 的综合词频顺序输出（配合《首两笔速查手册》高频字优先）。
+  -- 首两笔选字优化：短码（<=2笔）时按 chars_for 的综合词频顺序输出
+  --（配合《首两笔速查手册》：12 → 去过事起可想要都下）。
+  -- 但「本码正好是某字完整码」的字必须出现（12 = 十/丁、34 = 八、52 = 了…），
+  -- 否则用户打完完整码却看不到这个字 —— 追加在前 9 之后，不破坏速查顺序。
   local emitted = 0
   if #input <= 2 then
+    local shown = {}
     for _, item in ipairs(chars) do
       if item.stroke_symbol then
         yield(make_candidate('single', seg.start, seg._end, item.ch, input))
+        shown[item.ch] = true
         emitted = emitted + 1
       elseif not item.component then
         if emitted >= 9 then break end
         yield(make_candidate('single', seg.start, seg._end, item.ch, input))
+        shown[item.ch] = true
         emitted = emitted + 1
+      end
+    end
+    local extra = 0
+    for _, item in ipairs(chars) do
+      if extra >= 4 then break end
+      if item.exact and not item.component and not item.stroke_symbol and not shown[item.ch] then
+        shown[item.ch] = true
+        extra = extra + 1
+        yield(make_candidate('single', seg.start, seg._end, item.ch, input))
       end
     end
     return
@@ -2281,7 +2295,7 @@ end
 
 -- 连续输入兜底：分词键之后也给出「前几段成型词 + 末段单字」。
 -- 目的：任何时候都能先把已经打好的前几个字上屏，剩余输入继续打（整句输入不中断）。
-local function emit_partial_escape(parts, raw_input, seg, env)
+local function emit_partial_escape(parts, raw_input, seg, env, tail_only)
   if not parts or #parts < 1 then return end
   local offsets = compute_part_offsets(raw_input)
   local s = offsets[1] and offsets[1].start or seg.start
@@ -2294,6 +2308,7 @@ local function emit_partial_escape(parts, raw_input, seg, env)
   end
   local key = table.concat(parts, "'")
   local fast = phrase_stroke_index[key]
+  if tail_only then fast = nil end   -- 只要末段单字时，前段词一律不出（严格按段数）
   local n_phrase = 0
   if fast then
     for i = 1, math.min(#fast, OPEN_CONT_MAX) do
@@ -2302,12 +2317,15 @@ local function emit_partial_escape(parts, raw_input, seg, env)
       n_phrase = n_phrase + 1
     end
   end
-  if n_phrase == 0 then
+  if n_phrase == 0 and not tail_only then
     local hits = slice_phrase_bucket(parts)
     for i = 1, math.min(#hits, 3) do emit_phrase(hits[i]) end
   end
   -- 整句直出：多词组合（如 31'32'45' → 「我们记者」）
-  local sent = decode_sentence(parts, env)
+  -- 注意不能用 `tail_only and nil or decode(...)`：Lua 里 true and nil 得 nil，
+  -- 再 `nil or X` 会回到 X，等于没判断（这个坑真的踩到了）。
+  local sent = nil
+  if not tail_only then sent = decode_sentence(parts, env) end
   if sent and sent.text and sent.text ~= '' then
     local whole_end = offsets[#parts] and offsets[#parts]._end or seg._end
     yield(make_candidate('phrase', offsets[1] and offsets[1].start or seg.start, whole_end, sent.text, raw_input))
@@ -3031,12 +3049,13 @@ local function translator_body(input, seg, env)
     for _ in prefix_expr:gmatch("[^']+") do n_prefix_parts = n_prefix_parts + 1 end
     if prefix_expr ~= "" and not prefix_expr:find("''", 1, true) and n_prefix_parts >= 2 then
       emit_open_continuation(prefix_expr, input, seg, env)
-      -- 追加「前段词 + 末段单字」：连打/整句输入时可以随时先上屏前几个字
+      -- 追加末段单字，保证「当前这个字」随时可选（否则末段菜单为空会显示原始数字）。
+      -- 严格模式只要单字；非严格模式还要「前段词 + 整句」，方便提前上屏。
       local p_parts = {}
       for p in prefix_expr:gmatch("[^']+") do
         if p:match("^[12345?]+$") then p_parts[#p_parts + 1] = p end
       end
-      emit_partial_escape(p_parts, input, seg, env)
+      emit_partial_escape(p_parts, input, seg, env, STRICT_SEGMENTS)
       return
     end
   end
@@ -3094,21 +3113,11 @@ local function translator_body(input, seg, env)
     -- 这里用去掉首尾分词符的副本判断，raw_input 仍用原串以保证候选偏移正确。
     local core = parse_input:gsub("'+$", "")
     if core:match("^[12345?]+$") then
-      -- 无分词整句：≥8 位的连续码先做 beam 切分 + 词合并，给整句候选
-      if BEAM_ENABLE and #core >= 8 then emit_beam_sentence(core, seg, env) end
-      -- 整句输入：连续码自动组词（不打分词符也能出「我们」这类词）
-      local has_exact = exact_stroke[core] and #exact_stroke[core] > 0
-      -- 短码（<=4 位）优先出单字：4 位码通常是「一个字的完整笔顺」（含笔误），
-      -- 若先出自动组词，会把纠错命中的本字挤到后面（如 1243 撇捺写反 → 木 排第 7）。
-      if has_exact or #core <= 4 then
-        -- 整串恰好是某个字的完整码：单字优先，词随后
-        emit_single(core, seg, env)
-        if not STRICT_SEGMENTS then emit_auto_words(core, seg, env) end
-      else
-        -- 整串不是一个字：自动组词优先（这才是「整句输入」想要的结果）
-        if not STRICT_SEGMENTS then emit_auto_words(core, seg, env) end
-        emit_single(core, seg, env)
-      end
+      -- 无分词输入 = 只出单字（硬规则，不看任何配置）。
+      -- 曾经这里有 emit_auto_words / emit_beam_sentence 两条「不打分词符也出词」的路径，
+      -- 结果无分词时冒出「十一」「我们」这类多字候选，违反「无分词=1字」的规则。
+      -- 现在彻底移除：想要词就打分词符，规则只有一条。
+      emit_single(core, seg, env)
       return
     end
   end

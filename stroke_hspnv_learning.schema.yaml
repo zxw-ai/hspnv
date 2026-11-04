@@ -203,7 +203,7 @@ segment_phrase:
   reorder_tolerance: true  # 相邻两笔顺序颠倒容错（如 木 1234 打成 1243 也能出）
   open_continuation_max: 3  # 按分词键后的 N+1 字词联想条数上限（铺满会把当前字挤到后面）
   strict_by_segments: true  # 严格按段数出词：N 个分词符 → 只出 N+1 字词（不掺前缀词、无分词不出词）
-  sentence_punct: true  # 整句置顶时追加「整句+句号」变体
+  sentence_punct: false # 整句置顶时追加「整句+句号」变体（会多一个字符，破坏「段数=字数」的严格规则，默认关）
   time_context: true    # 时段感知：早/中/晚/深夜给相关词加分（只在无强上下文时生效）
   time_weight: 150000   # 时段加分额度（与静态语料同量级才有效）
   short_head_freeze: 2  # 短码（1~2 笔）：前 N 位冻结（保住《首两笔速查》），之后按用户频次重排
