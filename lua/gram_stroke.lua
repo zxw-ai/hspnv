@@ -1,5 +1,5 @@
 -- 大语言模型高频搭配表（元书防杀分层精简版，按长度 2-8 分层取高频）
--- 来源：stroke-zh-hans.gram（源自 wanxiang-lts-zh-hans.gram 418MB 模型）
+-- 来源：stroke-zh-hans.gram（源自 hspnv-lts-zh-hans.gram 418MB 模型）
 -- 保留模型联想能力（含我们/今天/中国等基础搭配），控制 Lua 内存。
 return {
   ["的你"]=182889,

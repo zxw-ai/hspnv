@@ -76,7 +76,34 @@ local function save()
 end
 
 ------------------------------------------------------------
--- 二、配置读取
+-- 二、重置接口（供 super_sequence 重置键 / 未来全局恢复调用）
+------------------------------------------------------------
+
+-- 取消单个词的降权：移出降权表 + 恢复学习频次（重置键调用）
+function M.clear(w, env)
+  load()
+  if not w or w == '' then return end
+  if not demoted[w] then return end
+  demoted[w] = nil
+  save()
+  pcall(function() learning.undemote(w, env) end)
+end
+
+-- 清空全部降权记录并逐一恢复学习频次（全局恢复默认顺序）
+function M.clear_all(env)
+  load()
+  local words = {}
+  for w in pairs(demoted) do words[#words + 1] = w end
+  if #words == 0 then return end
+  demoted = {}
+  save()
+  for _, w in ipairs(words) do
+    pcall(function() learning.undemote(w, env) end)
+  end
+end
+
+------------------------------------------------------------
+-- 三、配置读取
 ------------------------------------------------------------
 
 local function get_config(env)
@@ -96,7 +123,7 @@ local function get_trigger_key(env)
 end
 
 ------------------------------------------------------------
--- 三、处理器（librime-lua 调用 func 字段）
+-- 四、处理器（librime-lua 调用 func 字段）
 ------------------------------------------------------------
 
 function M.func(key_event, env)
@@ -125,15 +152,19 @@ function M.func(key_event, env)
     load()
     if demoted[text] then
       demoted[text] = nil   -- 已在降权表：取消降权
+      save()
+      -- 取消降权时同步恢复学习频次（与降权减半对称）
+      pcall(function()
+        learning.undemote(text, env)
+      end)
     else
       demoted[text] = true  -- 降权（任意词）
+      save()
+      -- 若该词在学习数据中，同时降低学习频次（双保险）
+      pcall(function()
+        learning.demote(text, env)
+      end)
     end
-    save()
-
-    -- 若该词在学习数据中，同时降低学习频次（双保险）
-    pcall(function()
-      learning.demote(text, env)
-    end)
 
     -- 尝试立即移除当前候选（对 Lua 候选可能无效，失败无妨）
     pcall(function()

@@ -1,5 +1,5 @@
 -- gram_model.lua
--- 借鉴 Rime::Grammar（wanxiang-lts-zh-hans.gram）语言模型设计，
+-- 借鉴 Rime::Grammar（hspnv-lts-zh-hans.gram）语言模型设计，
 -- 为 hspnv 笔画方案构建的轻量 n-gram 搭配语言模型。
 --
 -- Rime::Grammar 思路：
@@ -24,7 +24,7 @@ local ok_words, words = pcall(require, 'words')
 if not ok_words or type(words) ~= 'table' then
   words = {}
 end
--- 大语言模型搭配表（由 stroke-zh-hans.gram 提取，源自 wanxiang-lts-zh-hans.gram 418MB 模型）
+-- 大语言模型搭配表（由 stroke-zh-hans.gram 提取，源自 hspnv-lts-zh-hans.gram 418MB 模型）
 -- gram_stroke（2.7MB 源码 / 15MB 运行时）按需加载：只有真正查询搭配分时才载入，
 -- 避免「启用了语法模型但整局没用到」时白占内存（P1 优化，2026-10-30）。
 local gram_stroke = nil
@@ -86,7 +86,7 @@ function M.query(context, word)
       if x == word then return 0.9 end
     end
   end
-  -- 3. 大语言模型搭配（stroke-zh-hans.gram 提取的高频词串，源自 wanxiang 418MB 模型）
+  -- 3. 大语言模型搭配（stroke-zh-hans.gram 提取的高频词串，源自 hspnv 418MB 模型）
   local combined = prev .. word
   local n = utf8_count(combined)
   if gram_stroke and n >= COLLOCATION_MIN and n <= COLLOCATION_MAX then

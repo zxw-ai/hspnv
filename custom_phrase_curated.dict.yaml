@@ -10,7 +10,7 @@
 # 添加你自己的词条时，把编码换成上面两类笔画码之一即可。
 #
 ---
-name: custom_phrase
+name: custom_phrase_curated
 version: "1.0"
 sort: original
 use_preset_vocabulary: false

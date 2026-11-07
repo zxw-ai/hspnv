@@ -4,8 +4,8 @@
 
 打一串笔画，直接给你一句候选；打两笔，先出单字；打 `1'1`，出「或者」。
 
-> 当前版本：2026-10-30（整句 DP 真概率 + 数据打包 + 简码分隔符）
-> 实测：启动 5.9s / Lua 内存 59MB（iSH），整句首位还原 18/18
+> 当前版本：2026-11-07（重置键 + 词库增强 + gram/ext 恢复 + 个人三元组扩容）
+> 实测：整句首位还原 18/18，每键 15~35ms（150→60 候选 + 桶缓存 + DP 缓存）
 
 ---
 
@@ -61,7 +61,9 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 
 把你的聊天记录/常用语喂进去，生成 bigram + trigram，启动时作为**低权重种子**并入上下文模型（用户实时学习仍优先）。
 
-> 语料文件含个人内容，**不要提交到公开仓库**（已在 `.gitignore` 中排除）。
+当前种子规模：bigram **6,834** 条 / trigram **6,474** 条（2026-11-07 从 5,507 条个人消息中挖掘补充 1,090 条）。
+
+> 语料文件含个人内容，**不要提交到公开仓库**（已在 `.gitignore` 中排除，仓库里也没有）。
 
 ### 5. 简码（带分词符）
 
@@ -75,15 +77,40 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 - 打 `1'1` → 「或者 / 现在 / 需要」置顶
 - 双保险：词库层（带 `'` 的编码）+ `lua/quick_codes.lua`（lua 层精确命中的兜底）
 
-### 6. 其他
+### 6. 手动干预：置顶 / 上移 / 下移 / 降权 / 重置
+
+| 键 | 发送 | 作用 |
+|---|---|---|
+| 下移 | `Control+k` | 当前候选下移一位 |
+| 下移（上滑） | `Control+j` | 当前候选上移一位 |
+| 降权 | `Control+Delete` | 当前候选写入 `demote.user.tsv`，沉底 + 学习频次减半 |
+| 降权（下滑） | `Control+p` | 当前候选置顶 |
+| **重置（第三行）** | `Control+l` | **当前候选完全重置：恢复默认排序 + 取消降权 + 频次恢复** |
+
+**重置键**（皮肤 V116 新增）：原来第三行的「连打」键改为「重置」。按下后：
+
+1. `super_sequence` 写入重置墓碑，清掉该词的手动排序 → 回默认位置；
+2. 从 `demote.user.tsv` 移除该词 → 不再被 `demote_filter` 沉底；
+3. `learning.undemote` 把被减半的学习频次 ×2 恢复。
+
+> 降权本身**不会自动过期**（`demote.user.tsv` 里的时间戳只记录、不参与恢复）。想让降权词回到前面，就按「重置」键，或再按一次「降权」键取消。
+
+### 7. 其他
 
 - **首两笔选字**：1~2 笔时静态字频主导，与《首两笔速查手册》逐码一致
 - **3 笔以上**：用户上屏频次优先（学「呗」6 次后，它的完整码首位就是「呗」）
 - **自学习**：上屏加频（封顶 10 次）、30 天半衰期衰减、组合造词
-- **手动干预**：置顶 / 上移 / 下移 / 重置 / 降权（皮肤键）
 - **以词定字**：皮肤「首」「末」键
-- **连打**：上屏后按 Tab 直接接力联想词
+- **连打**：上屏后按 Tab 直接接力联想词（仅桌面；皮肤第三行已改为重置键）
 - **自动上屏**：唯一候选 + 高置信首位（阈值 0.8）
+
+---
+
+## 🎨 皮肤 V116
+
+- 文件：`skins/hspnv-多功能-v116.cskin`（4.16 MB，219 个条目，config.yaml 在根）
+- 改动（2026-11-07）：第三行 `numSwitchButton` 由「连打」（`Tab`）改为「重置」（`Control+l`）
+- 四套配色/布局同步：`light/dark × portrait/landscape`
 
 ---
 
@@ -91,10 +118,10 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 
 | 项 | 数值 |
 |---|---|
-| 启动（iSH） | 5.9s |
-| Lua 内存（GC 后） | 59MB |
-| 每键耗时 | 15~35ms（150→60 候选 + 桶缓存 + DP 缓存） |
+| Lua 内存（GC 后） | 59 MB |
+| 每键耗时 | 15~35 ms（150→60 候选 + 桶缓存 + DP 缓存） |
 | 整句还原 | 18/18（常用句首位） |
+| 方案体积 | 81.2 MB（恢复 gram/ext 后，2026-11-06） |
 
 优化手段（都是实测过的）：
 
@@ -103,7 +130,8 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 - `next_words_tri/big` 按词频裁剪（5.3+2.2MB → 1.6+1.6MB）
 - 一阶 Trie 桶落盘缓存（`bg5_bucket_cache.tsv`）
 - 候选上限 60，联想结果按上下文缓存（20ms → 0.2ms）
-- 关闭 gram 翻译器 / ext 翻译器 / gram_model（省 prism 构建 + 25MB 模型）
+
+> 恢复 `script_translator@gram` / `table_translator@ext` 后，**首次部署需要构建 stroke_script / stroke_ext 两个 prism，明显变慢**；`gram_model.enable` 仍为 false（省内存）。
 
 ---
 
@@ -113,21 +141,37 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 ├── stroke_hspnv_learning.schema.yaml   # 主方案
 ├── custom_phrase.schema.yaml           # 简码词典的构建载体（缺它置顶词会失效）
 ├── custom_phrase.dict.yaml             # 简码 + 全码短语（3026 简码 + 3030 全码）
-├── stroke_hspnv.dict.yaml               # 主词库（Rime 侧，当前未被 translator 引用）
+├── stroke_hspnv.dict.yaml              # 主词库（387k 词条）
+├── stroke_script.dict.yaml             # 整句/gram 翻译器词库（15.6MB）
+├── stroke-zh-hans.gram                 # 语法模型（10.1MB）
+├── stroke_ext.dict.yaml                # 扩展词库入口（成语/地理/人名/医学）
+├── stroke_ext_*.dict.yaml              # 四本扩展词典（8.2MB）
 ├── 使用说明.md                           # 完整文档（含常见问题排查）
+├── 首两笔速查手册.md                     # 每码前几位的单字顺序
 ├── lua/
 │   ├── segment_phrase.lua               # 主翻译器：单字/分词/整句DP/联想/自动组词
+│   ├── demote.lua                       # 降权处理器（写 demote.user.tsv）
+│   ├── demote_filter.lua                # 降权过滤器（沉底/隐藏）
 │   ├── filter_seg_count.lua             # 分词过滤 + 预编辑兜底
 │   ├── predict_next.lua                 # 上屏预测状态机 + 混合候选预算
 │   ├── learning.lua / ngram.lua         # 用户词频 / 上下文（bigram+trigram）
 │   ├── lm.lua                           # log10 概率（整句 DP 用）
 │   ├── preedit_util.lua                 # 预编辑统一实现（各段笔画符号）
-│   ├── quick_codes.lua                  # 简码 → 词（238 码 / 3026 条）
+│   ├── quick_codes.lua                  # 简码 → 词
 │   ├── words.lua / head_words.lua       # 词库（含打包格式）
 │   ├── phrase_stroke_index.lua          # 词组笔画索引（打包格式）
 │   ├── next_words_big/tri.lua           # 离线 bigram / trigram（裁剪版）
 │   ├── char_freq_token.lua              # 字 token 频率（概率底座）
-│   └── …（共 40 个模块）
+│   ├── hspnv/                           # 万象系模块（改名后）
+│   │   ├── hspnv.lua / userdb.lua / bit.lua
+│   │   ├── super_sequence.lua           # 手动排序 + 重置键
+│   │   ├── context_reorder.lua / partial_commit.lua
+│   │   └── custom_phrase.lua / charset_filter.lua
+│   ├── data/                            # 英文、符号、颜文字、提示语
+│   └── …（共 50+ 模块）
+├── opencc/
+│   ├── hspnv/                           # 简繁 / 变体 / emoji 词典
+│   └── hspnv_s2t.json / s2hk.json / s2tw.json
 ├── tools/
 │   ├── add_words.lua                    # 加自造词（自动算全码+简码）
 │   ├── split_short_codes.lua            # 简码加分词符
@@ -138,19 +182,19 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 │   ├── gen_personal_ngram.lua           # 个人语料 → n-gram
 │   └── hotword_update.py                # 热词订阅
 └── skins/
-    ├── hspnv-多功能-v116.cskin           # 最新皮肤
-    └── hspnv-多功能-v113.cskin
+    └── hspnv-多功能-v116.cskin           # 最新皮肤（重置键）
 ```
 
 ---
 
 ## 🚀 部署
 
-1. 把方案文件复制到元书的 Rime 用户目录（`stroke_hspnv_learning.schema.yaml`、`custom_phrase*.yaml`、`lua/`、`tools/`）
+1. 把方案文件复制到元书的 Rime 用户目录（`stroke_hspnv_learning.schema.yaml`、`custom_phrase*.yaml`、`stroke_script/gram/ext`、`lua/`、`opencc/`、`tools/`）
 2. 元书 → 设置 → 皮肤 → 导入 `skins/hspnv-多功能-v116.cskin`
-3. 元书 → **重新部署方案**（首次构建词典约 1~2 分钟）
+3. 元书 → **重新部署方案**（首次构建 prism 约 1~2 分钟）
 
 > 改了 `lua/` 或词典后都要重新部署；只改 lua 可跳过重建词典。
+> `personal_ngram.tsv` 只能本地放（`<user_dir>/personal_ngram.tsv` 或方案目录），重新部署时载入。
 
 ---
 
@@ -165,8 +209,11 @@ tools/gen_personal_ngram.lua  →  personal_ngram.tsv
 | 不打分词出词 | `3132` → 我们 |
 | 提前上屏前缀 | 选候选里的「我们」（前缀词） |
 | 以词定字 | 「首」键取首字 /「末」键取末字 |
-| 连打 | 上屏后按 Tab |
-| 置顶/降权/重置 | 皮肤「降权」键（下滑/点击/上滑） |
+| 连打（桌面） | 上屏后按 Tab |
+| 上移 / 下移 | 皮肤「下移」键（点按 / 上滑） |
+| 置顶 | 皮肤「降权」键下滑 |
+| 降权 | 皮肤「降权」键点按 |
+| **重置当前候选** | **皮肤第三行「重置」键** |
 
 ---
 
@@ -192,6 +239,16 @@ custom_phrase:
   spelling_hints: 0          # 不显示编码数字
   preedit_format: xlit/12345/一丨丿丶乛/
 
+super_sequence:
+  up: "Control+j"       # 皮肤「下移」键上滑
+  down: "Control+k"     # 皮肤「下移」键点按
+  reset: "Control+l"    # 皮肤第三行「重置」键
+  pin: "Control+p"      # 皮肤「降权」键下滑
+
+demote:
+  key: "Control+Delete" # 皮肤「降权」键点按
+  mode: demote          # demote=沉底；hide=隐藏
+
 gram_model:
   enable: false         # 关闭语法模型（省 15MB）
 ```
@@ -203,6 +260,7 @@ gram_model:
 - **多词整句**依赖词库：词库没有的组合只能退化为逐字拼接（仍可一次上屏，但可能不自然）
 - **无分词连续码**只做单词级自动切分，不做整句 DP（字边界未知，组合爆炸）
 - **单字个性化在短码下几乎无效**（静态字频 1e8 量级），这是为保证《首两笔速查》顺序
+- **降权不会自动过期**：`demote.user.tsv` 只写时间戳不读，需要「重置」键手动恢复
 - **ngram 搭配不衰减**（learning 的词频会衰减，两者策略不同）
 - 词里的字必须在 `stroke.lua` 笔画表（约 8500 字）内，生僻字不支持
 
@@ -210,12 +268,19 @@ gram_model:
 
 ## 📝 更新日志
 
+### 2026-11-07
+- 皮肤 V116：第三行「连打」键改为「重置」键（`Control+l`），外显「重置」
+- 重置语义落地：默认排序 + 取消降权（移出 `demote.user.tsv`）+ 学习频次恢复
+- 修复：取消降权时仍调 `learning.demote` 反向再减半频次的 bug
+- 恢复 `script_translator@gram` / `table_translator@ext` 与配套词库（之前误删文件，非停用功能）
+- 个人语料扩容：trigram 5,384 → 6,474（从 5,507 条个人消息挖掘）
+- 模块改名 `wanxiang/*` → `hspnv/*`，仓库结构同步
+
 ### 2026-10-30
 - 整句解码 v2：log10 真概率（新增 `lm.lua`、`char_freq_token.lua`），18 条常用句首位 18/18
-- 数据格式改造：`head_words` / `phrase_stroke_index` 打包、`next_words_*` 裁剪 → 147MB→59MB、8.7s→5.9s
+- 数据格式改造：`head_words` / `phrase_stroke_index` 打包、`next_words_*` 裁剪 → 147MB→59MB
 - 简码改为带分词符（`1'1`），新增 `quick_codes.lua` 兜底与 `add_words` 工具
 - 用户三元组（上下文联想）、缓存上限、`preedit_util` 统一预编辑实现
-- 关闭 `script_translator@gram` / `table_translator@ext` / `gram_model`
 - 修复：预编辑区显示数字、多段 composition 无候选、简码抢占单字位
 
 ### 更早
@@ -226,7 +291,7 @@ gram_model:
 ## 🙏 参考与致谢
 
 - **白霜拼音**（gaboolic/rime-frost）：主词库语料
-- **万象拼音**（amzxyz/rime-wanxiang）：联想机制、predict 接入、短语库
+- **万象拼音**（amzxyz/rime-wanxiang）：联想机制、predict 接入、短语库、super_sequence
 - **键道·我流**（pingshunhuangalex/rime-keydo）：顶功自动上屏、衔接词优先
 - **oh-my-rime**（Mintimate/oh-my-rime）：以词定字
 - **雾凇拼音**（iDvel/rime-ice）：词库净化思路

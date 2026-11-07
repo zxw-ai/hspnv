@@ -67,6 +67,9 @@ end
 local phrase_stroke_index = require('phrase_stroke_index')
 local next_words = require('next_words')
 local next_words_big = require('next_words_big')
+-- next_words_tri（13.5MB，1.67MB 文件）：只在「连续上屏两词后的三连联想」用到。
+-- 曾试过懒加载（省 13.5MB 常驻），但首次三连联想要付一次 13MB 表的解析开销（可能几百 ms），
+-- 实机未被杀后台的前提下，宁可启动时一次性加载，避免偶发卡顿。
 local next_words_tri = require('next_words_tri')
 local phrase_assoc = require('phrase_assoc')
 local phrase_assoc_tri = require('phrase_assoc_tri')
@@ -128,6 +131,19 @@ local PREFIX_EXT_DISCOUNT = 0.5  -- 抑制时延长字权重打对折
 -- 按分词键（末尾 '）后的「N+1 字词联想」条数上限（移植自 qwen 的 open_continuation_max）：
 -- 铺满会让「前缀词 + 末段单字」翻到后面，用户刚打完的那个字反而找不回来。
 local OPEN_CONT_MAX = 3
+-- 整词/整句候选池上限（对标风灵输入法的 20 候选重排批）：
+-- 候选多不等于好——超过 20 条之后的部分几乎不会被翻到，却要参与排序与后续过滤器遍历，
+-- 拖慢长句输入的响应。20 条内按分数排序，其余丢弃（想要更多用更长码或分词符缩小范围）。
+local POOL_MAX = 20
+-- 精确码优先：词库里有「完整码命中」的候选时，整句 DP 候选不参与首页前排（不挤掉精确命中）。
+-- 形码方案里精确码就是用户要的字，任何模型打分都不该把它压下去（水杉实测：精确命中交给
+-- 重排反而变差 0.719→0.690）。对应风灵那种「短码也重排」的做法，我们明确不学。
+local EXACT_FIRST = true
+-- bigram 接续先验强度（单位=用户上屏次数）：0 关闭，默认 3。见 bigram_bonus 的实测依据。
+local BIGRAM_SCALE = 3
+-- 反向搭配弱加分（prev 出现在候选的后接表里）：默认开，强度 1（≈1/3 次上屏）
+local BIGRAM_REVERSE = true
+local BIGRAM_REVERSE_SCALE = 1
 local PREDICT_MAX = 8       -- 空输入联想候选数（menu/page_size 一页 9 个，留 1 位给 predict_next 混合候选）
 local GRAM_ENABLE = false
 local GRAM_WEIGHT = 60000
@@ -169,6 +185,16 @@ local function load_settings(env)
     if ss ~= nil then STRICT_SEGMENTS = ss end
     local sp_ = cfg:get_bool('segment_phrase/sentence_punct')
     if sp_ ~= nil then SENTENCE_PUNCT = sp_ end
+    local pm_ = cfg:get_int('segment_phrase/pool_max')
+    if pm_ and pm_ > 0 then POOL_MAX = pm_ end
+    local ef_ = cfg:get_bool('segment_phrase/exact_first')
+    if ef_ ~= nil then EXACT_FIRST = ef_ end
+    local bg_ = cfg:get_int('segment_phrase/bigram_scale')
+    if bg_ and bg_ >= 0 then BIGRAM_SCALE = bg_ end
+    local br_ = cfg:get_bool('segment_phrase/bigram_reverse')
+    if br_ ~= nil then BIGRAM_REVERSE = br_ end
+    local brs = cfg:get_int('segment_phrase/bigram_reverse_scale')
+    if brs and brs >= 0 then BIGRAM_REVERSE_SCALE = brs end
     local te = cfg:get_bool('segment_phrase/time_context')
       local tw = cfg:get_int('segment_phrase/time_weight')
       time_context.configure(te, tw)
@@ -1594,6 +1620,81 @@ local function calib_sf(w, raw_sf)
   return raw_sf
 end
 
+-- 「纯拼接整句」的合法性闸门。
+-- 背景：decode_sentence（词图 DP）失败时，旧代码会把「前缀词 + 末段最佳字」甚至
+-- 「每段最佳字」直接拼成一个候选并插到首页第 3 位，产出「我看每」「每段话十」这类
+-- 语义不通的假整句——用户会以为整句功能坏了，还可能误上屏。实测截图已多次出现。
+-- 规则：拼接结果只有在「确实是词库词」或「每段都真打完（≥3 笔且完整码命中）」时才成立。
+--   ① words[text]              → 天然合法
+--   ② 前缀词 + 末段完整码       → 末字是用户明确打出来的，拼接可信
+--   ③ 所有段都是完整码（≥3 笔） → 逐字打完整句，拼接即所得
+local function part_is_complete(p)
+  return p ~= nil and #p >= 3 and exact_stroke[p] ~= nil
+end
+local function concat_sentence_ok(text, parts, prefix_text)
+  if not text or text == '' then return false end
+  if words[text] then return true end
+  local n = #parts
+  if prefix_text then return part_is_complete(parts[n]) end
+  for i = 1, n do
+    if not part_is_complete(parts[i]) then return false end
+  end
+  return true
+end
+
+-- 接续先验（B 阶段核心）：用**已随引擎加载**的离线 bigram 表给整词候选加分。
+-- 数据依据（个人聊天语料 3682 对，与 bigram 表互为独立来源）：
+--   同首字候选池里，纯静态词频排序 top1 只有 4.8%、top5 21.2%；
+--   加入本特征后 top1 10.0%、top5 25.7%（top1 翻倍）。
+-- 权重单位 = 用户上屏次数（1 次 = WORD_UF_STEP），默认 3 次，schema 可调。
+local bg_cache_prev, bg_cache_pos = nil, nil
+local function bigram_pos(prev, w)
+  if not prev or prev == '' then return nil end
+  if bg_cache_prev ~= prev then
+    local list = next_words_big[prev] or next_words[prev]
+    local pos
+    if list then
+      pos = {}
+      for i = 1, #list do pos[list[i]] = i end
+    end
+    bg_cache_prev, bg_cache_pos = prev, pos
+  end
+  if not bg_cache_pos then return nil end
+  return bg_cache_pos[w]
+end
+local function bigram_bonus(prev, w)
+  local p = bigram_pos(prev, w)
+  if not p then return 0 end
+  local mult = 0.5
+  if p == 1 then mult = 3 elseif p <= 3 then mult = 2 elseif p <= 8 then mult = 1 end
+  return math.floor(WORD_UF_STEP * BIGRAM_SCALE * mult / 3)
+end
+
+-- 反向搭配弱加分：候选 w 的语境里常常出现 prev（词表是 w→[后接词]，
+-- 所以查 next_words_big[w] 里有没有 prev）。实测（3,055 条真实三元用例，cf 关）：
+-- top1 14.2% → 14.5%，零内存增量，故默认开启；不想要把 bigram_reverse 设 false。
+-- 反向表按候选缓存（20 条候选 × 每次至多 12 项），开销可忽略。
+local rev_cache_w, rev_cache_pos = nil, nil
+local function bigram_reverse_bonus(prev, w)
+  if not prev or prev == '' or not w then return 0 end
+  if not BIGRAM_REVERSE then return 0 end
+  if rev_cache_w ~= w then
+    local list = next_words_big[w] or next_words[w]
+    local pos
+    if list then
+      pos = {}
+      for i = 1, #list do pos[list[i]] = i end
+    end
+    rev_cache_w, rev_cache_pos = w, pos
+  end
+  if not rev_cache_pos then return 0 end
+  local p = rev_cache_pos[prev]
+  if not p then return 0 end
+  local mult = 1.0
+  if p <= 3 then mult = 1.5 elseif p > 8 then mult = 0.5 end
+  return math.floor(WORD_UF_STEP * BIGRAM_REVERSE_SCALE * mult / 3)
+end
+
 local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, full_len)
   -- 防爆上限：超过 MAX_WORD_LEN 的分词不再尝试匹配超长词（词库机构名等长词保留但不在此路径联想）
   if target_len > MAX_WORD_LEN then return end
@@ -1609,9 +1710,10 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     local exact = is_phrase_exact(w, parts)
     local uf = learning.freq(w, env)
     local cf = ngram.word_freq(last, w, env)
+    local bf = bigram_bonus(last, w) + bigram_reverse_bonus(last, w)
     local old = found[w]
-    if not old or (exact and not old.exact) or ((uf * WORD_UF_STEP + cf) > (old.uf * WORD_UF_STEP + (old.cf or 0))) then
-      found[w] = {text = w, sf = calib_sf(w, sf), uf = uf, cf = cf, exact = exact}
+    if not old or (exact and not old.exact) or ((uf * WORD_UF_STEP + cf + bf) > (old.uf * WORD_UF_STEP + (old.cf or 0) + (old.bf or 0))) then
+      found[w] = {text = w, sf = calib_sf(w, sf), uf = uf, cf = cf, bf = bf, exact = exact}
     end
   end
 
@@ -1780,13 +1882,14 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   local WHOLE_FIRST = 5     -- 首页整词名额
   local WAITING_FIRST = 2   -- 首页前缀词名额
   local LAST_CHARS = 2      -- 末段单字名额（首页 5 整词 + 2 前缀词 + 2 单字 = 9）
-  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete, sent_ok, last_done)
+  local function emit_all(emit_candidate, whole_phrases, waiting_items, parts, env, offsets, seg_start, seg_end, sentence, last_complete, sent_ok, last_done, exact_hit)
     local wholes = whole_phrases or {}
     local waits = waiting_items or {}
     local n_whole, n_wait = 0, 0
     -- 末段已是完整码（用户很可能打完了整句）→ 整句候选置顶
     -- 只有「DP 词组合」结果才配置顶（简单拼接的「我们今」这类不算打完）
-    if last_complete and sent_ok and sentence and sentence ~= '' then
+    -- 精确码命中（exact_hit）时不置顶：形码里完整码就是用户要的，整句不能压它。
+    if last_complete and sent_ok and sentence and sentence ~= '' and not exact_hit then
       emit_candidate('phrase', sentence, seg_start, seg_end)
       -- 带句号的变体：写长句时一次上屏，省一个标点键
       if SENTENCE_PUNCT then
@@ -1807,7 +1910,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
     -- 非置顶时，整句固定插在第 2 个整词之后（首页第 3 位），
     -- 避免被 5 个整词挤到首页末尾/第二页
-    local insert_at = (not last_complete or not sent_ok) and 2 or nil
+    local insert_at = (not last_complete or not sent_ok) and not exact_hit and 2 or nil
     for i, item in ipairs(wholes) do
       if i > WHOLE_FIRST then break end
       n_whole = i
@@ -1818,7 +1921,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
     -- 整句直出：已在前两处输出过（置顶 或 第 2 个整词之后），这里不重复。
     -- 仅当首页整词不足 2 个（无法插入）时兜底输出。
-    if sentence and sentence ~= '' and not last_complete and n_whole < 2 then
+    if sentence and sentence ~= '' and not last_complete and n_whole < 2 and not exact_hit then
       emit_candidate('phrase', sentence, seg_start, seg_end)
     end
     -- ② 其余整词：先把「N 字词」这一层全部铺满，候选区结构才不乱
@@ -1930,7 +2033,10 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
       end
       if prefix_text then
         local tail = best_char2(parts[#parts])
-        if tail then sentence2 = prefix_text .. tail end
+        if tail then
+          local j2 = prefix_text .. tail
+          if concat_sentence_ok(j2, parts, prefix_text) then sentence2 = j2 end
+        end
       else
         local buf = {}
         for i, pp in ipairs(parts) do
@@ -1938,13 +2044,16 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
           if not ch then buf = nil break end
           buf[i] = ch
         end
-        if buf then sentence2 = table.concat(buf) end
+        if buf then
+          local j2 = table.concat(buf)
+          if concat_sentence_ok(j2, parts, nil) then sentence2 = j2 end
+        end
       end
     end
     -- 空整词分支同样支持「末段完整 → 整句置顶」（否则 4 段词库无组合时整句拿不到首位）
     local lpc2 = parts[#parts]
     local last_complete2 = lpc2 and #lpc2 >= 3 and exact_stroke[lpc2] ~= nil
-    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2, last_complete2, sent2 ~= nil and #sent2.segs >= 2, last_complete2)
+    emit_all(add_output, nil, waiting, parts, env, offsets, seg.start, seg._end, sentence2, last_complete2, sent2 ~= nil and #sent2.segs >= 2, last_complete2, false)
 
     -- 3. 无整词时部分回退：保护前段词 + 末段按笔画重新定字（不再整串笔画兜底）
     local has_any = false
@@ -1964,7 +2073,8 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
 
   table.sort(order, function(a, b)
     if a.exact ~= b.exact then return a.exact end
-    local au, bu = a.uf * WORD_UF_STEP + (a.cf or 0), b.uf * WORD_UF_STEP + (b.cf or 0)
+    local au = a.uf * WORD_UF_STEP + (a.cf or 0) + (a.bf or 0)
+    local bu = b.uf * WORD_UF_STEP + (b.cf or 0) + (b.bf or 0)
     if au ~= bu then return au > bu end
     -- 用校准后的 sf 排序（词库里 20000/1201 这类占位值会把合成词顶到前面）
     if a.sf ~= b.sf then return a.sf > b.sf end
@@ -1987,8 +2097,12 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
     end
     return false
   end
+  -- 精确码命中标记：order 已按 exact 优先排序，首位 exact 即说明「完整码命中词库」。
+  local exact_hit = EXACT_FIRST and (order[1] ~= nil and order[1].exact == true) or false
   local whole_phrases = {}
-  for _, item in ipairs(order) do
+  -- 池上限：只保留前 POOL_MAX 条整词/整句候选（其余翻不到，白算白占）。
+  for i, item in ipairs(order) do
+    if i > POOL_MAX then break end
     whole_phrases[#whole_phrases + 1] = {text=item.text}
   end
   local waiting = {}
@@ -2046,7 +2160,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
       if tail then
         local joined = prefix_text .. tail
         -- 只有拼接后确实是词库词、或前缀本身只有 2 段（「我们」+字）时才用
-        if words[joined] or #parts == 2 then sentence = joined end
+        if concat_sentence_ok(joined, parts, prefix_text) then sentence = joined end
       end
     else
       local buf = {}
@@ -2055,7 +2169,10 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
         if not ch then buf = nil break end
         buf[i] = ch
       end
-      if buf then sentence = table.concat(buf) end
+      if buf then
+        local j3 = table.concat(buf)
+        if concat_sentence_ok(j3, parts, nil) then sentence = j3 end
+      end
     end
   end
   local last_part_code = parts[#parts]
@@ -2063,7 +2180,7 @@ local function emit_phrase_with_parts(parts, target_len, raw_input, seg, env, fu
   -- 如 八=34、了几=52，会把还在输入中的情况误判成整句完成）
   local last_complete = last_part_code and #last_part_code >= 3 and exact_stroke[last_part_code] ~= nil
   local last_done = last_complete
-  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2, last_done)
+  emit_all(add_output, whole_phrases, waiting, parts, env, offsets, seg.start, seg._end, sentence, last_complete, sent ~= nil and #sent.segs >= 2, last_done, exact_hit)
 
   -- DP 分词结果：每个词及其前缀累积，可作为独立候选（span 精确到输入片段）
   -- 严格模式下不输出：这些是「N 字词」，违反「只出 N+1 字词」
@@ -2804,7 +2921,7 @@ local function build_predict_continuations(env)
     end
     return 0
   end
-  -- 语言模型分（借鉴 Rime::Grammar / wanxiang-lts-zh-hans.gram）：
+  -- 语言模型分（借鉴 Rime::Grammar / hspnv-lts-zh-hans.gram）：
   -- 根据「上下文 last + 候选词」的 n-gram 搭配合理性加分，让联想更自然。
   -- 配置由 load_settings 惰性加载一次（避免每次联想重复读 schema / configure）。
   local gram_enable = GRAM_ENABLE

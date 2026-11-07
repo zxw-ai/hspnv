@@ -1,0 +1,16 @@
+# Rime dictionary: stroke_ext
+# encoding: utf-8
+#
+# hspnv 扩展词库（父词典）。当前四个主题全部启用（成语/人名/医学/地理）。
+# 想停用某个主题，把对应行前加 # 并重新部署。
+---
+name: stroke_ext
+version: "1.0"
+sort: by_weight
+use_preset_vocabulary: false
+import_tables:
+- stroke_ext_chengyu          # 成语俗语（约2.6万）
+- stroke_ext_renming          # 历史新闻常见人名（约5万）
+- stroke_ext_yixue            # 中西医学医药（约5万）
+- stroke_ext_dili             # 天文地理海洋（约2.3万）
+...

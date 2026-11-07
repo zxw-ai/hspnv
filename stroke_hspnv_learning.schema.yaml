@@ -35,14 +35,14 @@ switches:
 engine:
   processors:
     - lua_processor@*switch_panel                  # 功能开关面板：F4 打开/关闭，数字键切换（皮肤「功能切换」键发送 F4）
-    - lua_processor@*wanxiang.context_reorder*P  # 上下文调频
-    - lua_processor@*wanxiang.super_sequence*P   # 手动排序：Ctrl+j 上移 / Control+k 下移 / Ctrl+l 重置 / Ctrl+p 置顶（对应皮肤「下移」「降权」键）
+    - lua_processor@*hspnv.context_reorder*P  # 上下文调频
+    - lua_processor@*hspnv.super_sequence*P   # 手动排序：Ctrl+j 上移 / Control+k 下移 / Ctrl+l 重置 / Ctrl+p 置顶（对应皮肤「下移」「降权」「重置」键）
     - lua_processor@*auto_commit                  # 自动上屏：唯一候选 + 高置信首位（下一键顶功提交）
     - lua_processor@*punct_commit                  # 标点顶字：按标点键时先提交高亮候选再上屏标点（连续成句）
     - lua_processor@*select_character           # 以词定字：皮肤「首」键(\=backslash)取首字 / 「尾」键(;=semicolon)取末字
     - lua_processor@*demote                     # 手动降权：对当前高亮候选降频（皮肤「降权」键点击发送 Control+Delete）
-    - lua_processor@*predict_space               # 连打键上屏联想：上屏后按「连打」键(Tab)直接上屏联想候选（万象机制）
-    - lua_processor@*wanxiang.partial_commit    # 局部提交：Ctrl+1~0 提交句子前几个字
+    - lua_processor@*predict_space               # 连打键上屏联想：上屏后按 Tab 直接上屏联想候选（万象机制；原皮肤第3行连打键已改为重置键，仅桌面 Tab 可用）
+    - lua_processor@*hspnv.partial_commit    # 局部提交：Ctrl+1~0 提交句子前几个字
     - predictor
     - ascii_composer
     - recognizer
@@ -60,30 +60,31 @@ engine:
     - fallback_segmentor
   translators:
     - punct_translator
-    - lua_translator@*wanxiang_super_calculator
+    - lua_translator@*hspnv_super_calculator
     - lua_translator@*segment_phrase
     - lua_translator@*switch_panel_t             # 功能开关面板：输入面板标记时输出开关候选（独立翻译器模块）
-    # ── 以下三个翻译器默认禁用（P0 内存/启动优化，2026-10-30）────────────────
-    # 1) script_translator@gram：要构建 stroke_script.dict.yaml(15.6MB) 的 prism，
-    #    运行时再加载 stroke-zh-hans.gram(10.1MB)；自研 DP 已覆盖同功能。
-    # 2) predict_translator：predict.db(7.2MB)，与自研 predict_next 重复。
-    # 3) table_translator@ext：其成语主题与 lua 的 words_ext_chengyu 重复加载。
-    # 需要时取消对应行的注释即可（gram:/grammar:/ext: 段仍保留）。
-    # - script_translator@gram
+    # ── 翻译器说明（2026-11-06 已全部启用）────────────────────────────
+    # 1) script_translator@gram：启用。依赖 stroke_script.dict.yaml(15.6MB) 的 prism
+    #    与 stroke-zh-hans.gram(10.1MB)，提供 Rime::Grammar 搭配打分（gram:/grammar: 段）。
+    #    部署时需构建 prism，首次部署会明显变慢，属正常。
+    # 2) predict_translator：predict.db(7.2MB)，空输入预测段来源，保留。
+    # 3) table_translator@ext：启用。加载 stroke_ext 词典（成语 + 人名 + 医学 + 地理），
+    #    与 lua 的 words_ext_* 主题表并存（重复候选由 uniquifier 去重）。
+    - script_translator@gram
     # predict_translator 保留：它是「空输入预测段」的候选来源之一（自研 predict_next
     # 也依赖该预测段存在），删掉可能导致空输入联想消失，故不动。
     - predict_translator
-    # - table_translator@ext
+    - table_translator@ext
   filters:
     - lua_filter@*filter_seg_count                 # 笔画分词过滤（保留原学习核心）
     - lua_filter@*predict_next                     # 上屏自动预测增强：用户 bigram 直出 + 混合候选（必须靠前，注入候选才能走后面的字符集/简繁/去重过滤）
-    - lua_filter@*wanxiang.charset_filter          # 字符集过滤
-    - lua_filter@*wanxiang.custom_phrase           # 自定义置顶词
-    - lua_filter@*wanxiang.context_reorder*F        # 上下文调频
+    - lua_filter@*hspnv.charset_filter          # 字符集过滤
+    - lua_filter@*hspnv.custom_phrase           # 自定义置顶词
+    - lua_filter@*hspnv.context_reorder*F        # 上下文调频
     - simplifier@s2t                              # 简转繁
     - simplifier@s2hk                            # 简转港
     - simplifier@s2tw                            # 简转台
-    - lua_filter@*wanxiang.super_sequence*F       # 手动排序
+    - lua_filter@*hspnv.super_sequence*F       # 手动排序
     - lua_filter@*long_word_filter               # 长词优先（短码输入时多字词提前）
     - lua_filter@*demote_filter                     # 手动降权：降权词沉底/隐藏（任意候选生效）
     - uniquifier                                   # 去重
@@ -131,7 +132,7 @@ gram:
   contextual_suggestions: true
   initial_quality: 0.15
 
-# Rime::Grammar 语言模型（由 wanxiang-lts-zh-hans.gram 提取重建，适合笔画词库）
+# Rime::Grammar 语言模型（由 hspnv-lts-zh-hans.gram 提取重建，适合笔画词库）
 grammar:
   language: stroke-zh-hans
   collocation_max_length: 6
@@ -178,7 +179,7 @@ ngram:
   tri_enable: true       # 用户三元组：前两个上屏词 -> 下一个词（联想最高优先级）
   tri_cap: 2             # 三元组计数上限（防单条搭配霸榜）
 
-# 语言模型分（借鉴 Rime::Grammar / wanxiang-lts-zh-hans.gram 的 n-gram 搭配设计）：
+# 语言模型分（借鉴 Rime::Grammar / hspnv-lts-zh-hans.gram 的 n-gram 搭配设计）：
 # 在联想候选排序中，用「离线 bigram/trigram + 词典 collocation」给候选词打分，
 # 使上下文搭配更自然的候选更靠前。数据源：next_words_big/tri（万象 ARPA Top50万）+ words。
 gram_model:
@@ -204,6 +205,11 @@ segment_phrase:
   open_continuation_max: 3  # 按分词键后的 N+1 字词联想条数上限（铺满会把当前字挤到后面）
   strict_by_segments: true  # 严格按段数出词：N 个分词符 → 只出 N+1 字词（不掺前缀词、无分词不出词）
   sentence_punct: false # 整句置顶时追加「整句+句号」变体（会多一个字符，破坏「段数=字数」的严格规则，默认关）
+  pool_max: 20          # 整词/整句候选池上限（对标风灵 20 候选重排批；超出部分翻不到，只白算）
+  exact_first: true     # 精确码命中时不置顶/不插队整句候选（形码里完整码是用户要的，模型不该压它）
+  bigram_scale: 3       # 离线 bigram 接续先验强度（单位=用户上屏次数）：0 关闭；3 = 实测量最优起点
+  bigram_reverse: true  # 反向搭配弱加分（候选的后接表里出现上一个词）：零内存增量，实测 +0.3pt top1
+  bigram_reverse_scale: 1  # 反向加分强度（0=关闭，1≈1/3 次上屏）
   time_context: true    # 时段感知：早/中/晚/深夜给相关词加分（只在无强上下文时生效）
   time_weight: 150000   # 时段加分额度（与静态语料同量级才有效）
   short_head_freeze: 2  # 短码（1~2 笔）：前 N 位冻结（保住《首两笔速查》），之后按用户频次重排
@@ -272,12 +278,13 @@ context_reorder:
     - 米寸尺里斤两吨克升元角毛笔百千万亿
 
 # 手动排序快捷键
-# 手机皮肤：「下移」键点击 Control+k 下移、上滑 Control+j 上移；「降权」键点击 Control+Delete 降权、上滑 Ctrl+l 重置、下滑 Ctrl+p 置顶
+# 手机皮肤：「下移」键点击 Control+k 下移、上滑 Control+j 上移；「降权」键点击 Control+Delete 降权、下滑 Ctrl+p 置顶；
+#           「重置」键（第3行）点击 Control+l 重置当前候选（默认顺序 + 取消降权）
 super_sequence:
   db_name: "sequence"
   up: "Control+j"        # 上移（皮肤「下移」键上滑发送 Control+j）
   down: "Control+k"         # 下移（皮肤「下移」键点击发送 Control+k）
-  reset: "Control+l"     # 重置（皮肤「降权」键上滑发送 Control+l）
+  reset: "Control+l"     # 重置：恢复当前候选默认顺序 + 取消其降权（皮肤「重置」键发送 Control+l）
   pin: "Control+p"       # 置顶（皮肤「降权」键下滑发送 Control+p）
 
 # 降权功能键：桌面按 Control+Delete；皮肤「降权」键发送 ] 键（Rime 键名 bracketright）同样触发
@@ -302,7 +309,8 @@ auto_commit:
   # → 不顶功上屏「壬」）；1234→木、3445→今 照常顶功。关掉会回到「打一半就把中间字顶出去」。
   consider_prefix_extension: true
 
-# 连打键上屏联想词（移植自万象 enable_predict_space 机制；连打键默认 Tab，皮肤第3行表情键发送）
+# 连打键上屏联想词（移植自万象 enable_predict_space 机制；键位默认 Tab，仅桌面可用——
+# 原皮肤第3行连打键已改为「重置」键发送 Control+l）
 predict_space:
   enable: true
   key: "Tab"
@@ -335,19 +343,19 @@ charset_filter:
 
 s2t:
   option_name: s2t
-  opencc_config: wanxiang_s2t.json
+  opencc_config: hspnv_s2t.json
   tips: none
   tags: [abc]
 
 s2hk:
   option_name: s2hk
-  opencc_config: wanxiang_s2hk.json
+  opencc_config: hspnv_s2hk.json
   tips: none
   tags: [abc]
 
 s2tw:
   option_name: s2tw
-  opencc_config: wanxiang_s2tw.json
+  opencc_config: hspnv_s2tw.json
   tips: none
   tags: [abc]
 
