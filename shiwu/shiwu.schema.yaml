@@ -1,0 +1,68 @@
+# Rime schema
+# 二十键笔画输入法 · 元书 / Hamster 版
+schema:
+  schema_id: shiwu
+  name: 十五键笔画
+  version: "1.0"
+  author: Minis
+  description: |
+    15 键 = 5 单笔（一丨丿丶乛）+ 10 部件（十口厂亠亻讠勹扌了禾头）
+    单字 5 码（不足补末码）
+    词组：2字 2+3｜3字 1+2+2｜4字 1+1+1+2｜5字以上 前四字首码+末字首码
+    实测（7,319 字 / 179,944 词）：单字 5 码首选 60.5%，2字词 74.4%，4字词 90.6%
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: ["中文", "西文"]
+  - name: full_shape
+    states: ["半角", "全角"]
+  - name: ascii_punct
+    states: ["，。", "，."]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - lua_translator@*shiwu_wild_t
+    - punct_translator
+    - table_translator
+  filters:
+    - uniquifier
+
+speller:
+  alphabet: "qwertasdfghjklm*"
+  delimiter: " '"
+  max_code_length: 5
+  auto_select: false
+
+translator:
+  dictionary: shiwu
+  enable_chars: true
+  enable_user_dict: true
+  enable_sentence: false
+  enable_completion: true
+  initial_quality: 1.0
+  comment_format:
+    - "xform/^/ /"
+
+punctuator:
+  import_preset: default
+
+key_binder:
+  import_preset: default
+
+recognizer:
+  import_preset: default
