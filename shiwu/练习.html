@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>十五键笔画 · 打字练习</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:-apple-system,"PingFang SC",sans-serif;background:#f2f2f7;color:#1c1c1e;
+     display:flex;flex-direction:column;height:100vh;overflow:hidden;user-select:none}
+header{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#fff;border-bottom:1px solid #e5e5ea}
+.title{font-size:15px;font-weight:600;margin-right:auto}
+.tabs{display:flex;gap:6px}
+.tab{padding:5px 12px;border-radius:14px;background:#f2f2f7;font-size:13px;color:#3a3a3c;border:none}
+.tab.on{background:#1c1c1e;color:#fff}
+.stats{display:flex;gap:14px;padding:8px 14px;background:#fff;border-bottom:1px solid #e5e5ea;font-size:12px;color:#8e8e93}
+.stats b{color:#1c1c1e;font-size:15px;font-variant-numeric:tabular-nums}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;gap:14px;overflow:auto}
+.target{font-size:96px;line-height:1.1;font-weight:500;letter-spacing:2px}
+.target.small{font-size:64px}
+.hint{font-size:15px;color:#8e8e93;letter-spacing:6px;min-height:22px}
+.hint span{display:inline-block;min-width:28px;text-align:center}
+.hint .ok{color:#34c759;font-weight:600}
+.hint .cur{color:#1c1c1e;border-bottom:2px solid #1c1c1e}
+.entry{font-size:26px;letter-spacing:10px;font-family:ui-monospace,Menlo,monospace;color:#1c1c1e;min-height:34px}
+.entry .bad{color:#ff3b30}
+.feedback{font-size:14px;height:20px;color:#34c759}
+.feedback.bad{color:#ff3b30}
+.kb{background:#d1d1d6;padding:6px;display:flex;flex-direction:column;gap:6px;padding-bottom:max(6px,env(safe-area-inset-bottom))}
+.row{display:flex;gap:6px}
+.key{flex:1;height:52px;border-radius:9px;background:#fff;box-shadow:0 1px 0 #898a8d;
+     display:flex;flex-direction:column;align-items:center;justify-content:center;
+     font-size:19px;line-height:1.05;transition:transform .06s,background .1s}
+.key small{font-size:9px;color:#8e8e93;margin-top:1px}
+.key.down{transform:scale(.94);background:#e5e5ea}
+.key.accent{background:#fff}
+.key .ch{font-size:20px}
+.func{flex:1;height:44px;border-radius:9px;background:#adb5bd;box-shadow:0 1px 0 #898a8d;
+      display:flex;align-items:center;justify-content:center;font-size:13px;color:#1c1c1e}
+.func.on{background:#1c1c1e;color:#fff}
+@media (max-width:400px){.target{font-size:76px}.key{height:46px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">十五键打字</div>
+  <div class="tabs">
+    <button class="tab on" data-m="char">单字</button>
+    <button class="tab" data-m="word">词组</button>
+  </div>
+</header>
+<div class="stats">
+  <span>得分 <b id="score">0</b></span>
+  <span>正确率 <b id="acc">—</b></span>
+  <span>速度 <b id="spd">—</b></span>
+  <span style="margin-left:auto"><b id="streak">0</b> 连击</span>
+</div>
+<main>
+  <div class="target" id="target">十</div>
+  <div class="hint" id="hint"></div>
+  <div class="entry" id="entry"></div>
+  <div class="feedback" id="fb"></div>
+</main>
+<div class="kb" id="kb"></div>
+
+<script>
+const DATA = {"chars":[["的","gtqdt"],["了","lllll"],["我","mwqte"],["是","sqker"],["在","dwkkk"],["你","gjwer"],["和","mwers"],["有","dsqqq"],["不","dwrrr"],["就","fswef"],["都","kgtqq"],["也","ltttt"],["要","alwqt"],["吧","slqtt"],["好","tmlqq"],["他","glttt"],["说","hrgtd"],["去","ktrrr"],["到","qtfwa"],["没","rfjtr"],["还","dwrhr"],["上","wqqqq"],["对","tfwrr"],["那","tqdll"],["人","errrr"],["个","erwww"],["看","mdsqq"],["中","swwww"],["呢","stdjj"],["来","qrmwe"],["为","rjrrr"],["会","efqtr"],["她","tmltt"],["与","qtqqq"],["等","mrmfw"],["这","ferhr"],["用","jqaaa"],["把","klqtt"],["下","arrrr"],["恩","sefhr"],["能","trsdt"],["很","egtqq"],["多","jrjrr"],["做","gasme"],["想","aersq"],["点","watqr"],["被","hwehg"],["后","emsss"],["地","klttt"],["而","dwlww"],["一","qqqqq"],["又","trrrr"],["再","alqqq"],["时","sqarr"],["但","gsqqq"],["么","jrrrr"],["过","arhrr"],["打","kaaaa"],["大","drrrr"],["年","mkwww"],["啦","skfrm"],["以","trerr"],["里","skqqq"],["嗯","ssefh"],["着","rmqds"],["小","werrr"],["得","egsqq"],["先","mwdtt"],["啊","slata"],["或","atqqt"],["呀","sqlee"],["找","kqter"],["新","frmae"],["及","jrrrr"],["跟","swktq"],["於","fteer"],["太","drrrr"],["嘛","sfmwe"],["日","sqqqq"],["才","aeeee"],["可","ataaa"],["比","qtjjj"],["玩","qkqdt"],["们","grwtt"],["最","sqawq"],["月","jqqqq"],["真","asqqd"],["发","tjrrr"],["它","rhjjj"],["其","awqqd"],["话","hmwss"],["钱","mqqtq"],["叫","sllll"],["开","qdwww"],["出","lwlll"],["哈","sefss"],["当","wrjqq"],["向","gltqq"],["家","rhdte"],["问","rwltq"],["之","hrrrr"],["更","atqdr"],["走","kwdrr"],["快","rrser"],["前","rmsaw"],["由","swqqq"],["高","fswlt"],["您","gjwer"],["加","tgtqq"],["所","ejdmw"],["天","qdrrr"],["已","tqttt"],["啥","sefas"],["老","kejjj"],["搞","kfswl"],["行","egqaa"],["事","atqtq"],["拿","efsma"],["如","tmsss"],["死","dtrjj"],["像","gjsje"],["使","gatdr"],["成","dtter"],["无","qdttt"],["只","serrr"],["哪","stqdl"],["回","wltqq"],["少","weree"],["元","qdttt"],["卡","wqarr"],["靠","mwatk"],["算","mrmrs"],["者","kgtqq"],["忙","rrwft"],["起","kwdhq"],["各","jrsss"],["学","rrehl"],["分","eheee"],["咯","sjrss"],["水","wterr"],["改","tqtme"],["唉","strmd"],["三","qqqqq"],["万","qteee"],["见","wtjjj"],["车","qtaaa"],["放","fteme"],["全","efkkk"],["按","krhtm"],["机","aerjj"],["早","sqaaa"],["拉","kfrmm"],["弄","qkdww"],["本","aefff"],["偶","gsalq"],["性","rrwmk"],["第","mrmhq"],["完","rhqdt"],["同","sssss"],["花","awgjj"],["长","mtrrr"],["怕","rrwgt"],["女","tmmmm"],["些","wkjqq"],["住","gfkkk"],["名","jrsss"],["跑","swkjt"],["网","wtere"],["次","fjerr"],["睡","sqdkw"],["哦","smwqt"],["挺","kmwqt"],["王","qkkkk"],["掉","kwatq"],["路","swkjr"],["正","kwqqq"],["外","jrwrr"],["二","qqqqq"],["生","mkkkk"],["心","hrrrr"],["因","sefff"],["子","lqqqq"],["类","rmwef"],["作","gmwqq"],["送","rmdrh"],["书","tlrrr"],["每","mttfr"],["法","rfktr"],["乖","mwwqd"],["拍","kgtqq"],["市","fwlll"],["撒","kawat"],["至","qtfwq"],["接","kfrmt"],["美","rmkdr"],["表","qkjer"],["未","qaerr"],["非","wqqkq"],["级","ttdtr"],["即","tqqth"],["哎","sawer"],["此","wkjjj"],["差","rmqdk"],["版","gqtej"],["副","atatk"],["系","jtrwe"],["收","lmerr"],["男","swqte"],["俺","gdrsq"],["字","rhlqq"],["两","atere"],["股","jqdtt"],["便","gatqd"],["考","kmttt"],["线","ttqqq"],["手","maaaa"],["道","rmgtq"],["米","rmwer"],["座","feere"],["聊","awqqd"],["取","awqqq"],["低","gjqtr"],["哇","skkkk"],["受","erreh"],["包","jtqtt"],["阿","lataa"],["喝","ssdte"],["白","gtqqq"],["金","efarm"],["四","wtjqq"],["近","emwhr"],["管","mrmrr"],["定","rhker"],["传","gqqtr"],["门","rwttt"],["交","ferer"],["李","aehwq"],["笑","mrmrm"],["自","gtqqq"],["型","qdwww"],["黑","wtrmw"],["慢","rrwsa"],["刷","tdwlw"],["穿","rhefl"],["越","kwdft"],["位","gfrmm"],["贵","swate"],["部","frmsl"],["处","jrwrr"],["站","frmwa"],["牛","maaaa"],["怪","rrwtf"],["省","wergt"],["倒","gqtfw"],["谈","hreer"],["曾","rglrm"],["经","ttqtf"],["累","swqtt"],["汗","rfqaa"],["查","aersq"],["象","jsjee"],["半","rmaaa"],["种","mwers"],["红","ttqkk"],["格","aerjr"],["五","atqqq"],["方","fteee"],["读","hatrf"],["某","awqqa"],["唔","satat"],["马","ttqqq"],["单","rgtqq"],["海","rfmtt"],["相","aersq"],["光","wrmjj"],["咋","smwqq"],["且","sqqqq"],["林","aefwe"],["化","gjjjj"],["班","qkrmk"],["滴","rffrg"],["关","rmdrr"],["店","fgatq"],["安","rhtmm"],["坐","erefw"],["约","ttdtr"],["度","fmwwq"],["俄","gmwqt"],["歌","atksw"],["信","gfqat"],["若","awdss"],["文","ferrr"],["原","dgtqa"],["晚","sdltd"],["量","sqatq"],["村","aefwr"],["式","qktrr"],["空","rhefw"],["山","wllll"],["毛","mqttt"],["重","mskqq"],["主","fkkkk"],["另","steee"],["间","rwltq"],["入","errrr"],["伐","gqter"],["血","glwqq"],["爽","drere"],["往","egfkk"],["达","drhrr"],["国","skfff"],["片","gqttt"],["狗","jejss"],["岁","wljrr"],["费","tqtgw"],["共","awdrr"],["西","atjqq"],["周","jksss"],["超","kwdhg"],["明","sdtqq"],["均","kjfff"],["期","awqqd"],["照","sqtgt"],["切","qttee"],["留","jhgtk"],["动","qqthe"],["特","mwqka"],["气","mqttt"],["神","hwrsa"],["画","atkll"],["教","kjwdd"],["哥","atksw"],["甘","awqqq"],["值","gasqq"],["陪","lfrms"],["既","tqqtf"],["哭","ssdrr"],["力","teeee"],["建","tqqqa"],["洗","rfmwd"],["懂","rrwaw"],["口","sssss"],["指","kjsqq"],["东","qlerr"],["球","qkafe"],["仍","gteee"],["活","rfmws"],["跌","swkmd"],["练","ttqqt"],["亿","gtttt"],["清","rfqks"],["提","ksqke"],["除","lefae"],["通","trsah"],["酒","rfatj"],["票","alwqq"],["六","ferrr"],["病","fefat"],["咩","srmqa"],["假","gtkqt"],["久","jrrrr"],["段","gqqdt"],["平","qrmww"],["抓","kegrr"],["套","dfwqq"],["课","hsqae"],["急","jtqqh"],["城","kdtte"],["任","gmwqq"],["草","awsqa"],["理","qkskq"],["令","erhrr"],["雨","alrrr"],["唱","ssatq"],["左","dkkkk"],["县","sqqtr"],["常","wrehs"],["色","jlqtt"],["菜","awerr"],["集","gfqka"],["感","datqt"],["房","hdfte"],["混","rfsqq"],["敢","tawqq"],["火","reerr"],["操","ksssa"],["南","awtrm"],["退","tqqte"],["件","gmaaa"],["破","dstgt"],["德","egawl"],["局","tdltq"],["雪","qhwrr"],["噢","sgtrm"],["龟","jsqtt"],["龙","dterr"],["龄","wkehw"],["齿","wkehw"],["齐","fergg"],["鼻","gtqqa"],["鼠","gqtqq"],["鼓","ksrma"],["鼎","sqqtd"],["黯","wtrmw"],["默","wtrmw"],["黔","wtrmw"],["黎","mwerj"],["黄","awatk"],["麻","fmwef"],["麦","qkjrr"],["鹿","fjwwq"],["鹰","feggf"],["鹦","wterw"],["鹤","hgfqk"],["鹏","jqdtq"],["鹊","awatq"],["鹉","qkwqt"],["鹅","mwqte"],["鹃","ssdth"],["鸿","rfkjh"],["鸽","efsjh"],["鸵","jhqrh"],["鸳","jhtjh"],["鸯","serjh"],["鸭","sajhq"],["鸦","qlejh"],["鸥","dhjhq"],["鸣","sjhqq"],["鸡","trjhq"],["鸟","jhqqq"],["鳞","jswqq"],["鳖","rgler"],["鳍","jswqq"],["鳄","jswqa"],["鲸","jswqq"],["鲫","jswqq"],["鲨","rfwer"],["鲤","jswqa"],["鲜","jswqq"],["鲍","jswqd"],["鲁","jswqa"],["鱼","jswqq"],["魔","fmwef"],["魏","mwehm"],["魅","gtqdt"],["魄","gtqds"],["魂","qqtrg"],["魁","gtqdt"],["鬼","gtqdt"],["鬓","kqqtr"],["髓","wtths"],["骨","wtths"],["骤","ttqaw"],["骡","ttatk"],["骚","ttqtr"],["骗","ttqhd"],["骑","ttqdf"],["骏","ttqtr"],["验","ttdfr"],["骇","ttqft"],["骆","ttdtr"],["骄","ttddr"],["骂","ssttq"],["驾","tgtqt"],["驼","ttqrh"],["驻","ttqfk"],["驹","ttdlt"],["驶","ttatd"],["驴","ttqhd"],["驳","ttdre"],["驱","ttqdh"],["驰","ttqlt"],["驯","ttdww"],["驮","ttqdr"],["馨","kldjt"],["香","mwers"],["首","rmgtq"],["馒","jltqa"],["馏","jtjhg"],["馍","jtaws"],["馋","jtjsj"],["馈","jltkw"],["馆","jtrhs"],["馅","jtjgq"],["馁","jterr"],["饿","jtmwq"],["饼","jtrmd"],["饺","jtfer"],["饶","jtqtm"],["饵","jtawq"],["饲","jttat"],["饱","jtjtq"],["饰","jtmwl"],["饮","jtjer"],["饭","jtejr"],["饥","jtjjj"],["餐","wdthr"],["食","erhqq"],["飞","terrr"],["飘","alwqq"]],"words":[["中国","swskf"],["我们","mwgrw"],["可以","attre"],["什么","gajrr"],["时候","sqgsm"],["问题","rwsqk"],["现在","qkdwk"],["工作","kkgmw"],["生活","mkrfm"],["学习","rrtff"],["手机","maaer"],["电脑","sqjqq"],["时间","sqrwl"],["地方","klfte"],["东西","qlatj"],["朋友","jqdtr"],["孩子","lqlqq"],["父母","erttf"],["天气","qdmqt"],["今天","erqdr"],["明天","sdqdr"],["昨天","sdqdr"],["早上","sqwqq"],["晚上","sdwqq"],["吃饭","smjte"],["睡觉","sqrre"],["上班","wqqkr"],["下班","arqkr"],["学校","rraer"],["公司","ehtat"],["医院","dqlrh"],["银行","mqegq"],["超市","kwfwl"],["飞机","teaer"],["火车","reqta"],["汽车","rfqta"],["地铁","klmqq"],["照片","sqgqt"],["音乐","frjwe"],["电影","sqsqf"],["游戏","rftft"],["新闻","frrsw"],["网络","wtttd"],["微信","eggfq"],["支付","atgar"],["密码","rhdst"],["地址","klkwk"],["电话","sqhmw"],["名字","jrrhl"],["意思","frswq"],["方法","ftrfk"],["办法","terfk"],["结果","ttsqa"],["原因","dgsef"],["机会","aeefq"],["条件","jfgma"],["环境","qkkfr"],["经济","ttrff"],["政治","kwrft"],["文化","fegjj"],["教育","kjftr"],["科学","mwrre"],["技术","kaaer"],["艺术","awaer"],["历史","dtser"],["地理","klqks"],["数学","rmrre"],["语文","hafer"],["英语","awhat"],["考试","kmhqk"],["成绩","dtttq"],["老师","kewmw"],["学生","rrmkk"],["医生","dqmkk"],["警察","awrhj"],["司机","taaer"],["经理","ttqks"],["老板","keaer"],["同事","ssatq"],["同学","ssrre"],["邻居","ertda"],["城市","kdfwl"],["农村","hjaef"],["国家","skrhd"],["世界","awswd"],["社会","hwefq"],["家庭","rhfem"],["爱情","errrw"],["结婚","tttmj"],["恋爱","fwerr"],["幸福","krhwf"],["快乐","rrjwe"],["健康","gtfjq"],["运动","qqqqt"],["旅游","ftrff"],["酒店","rffga"],["餐厅","wddaa"],["咖啡","stswq"],["水果","wtsqa"],["蔬菜","awawe"],["米饭","rmjte"],["面包","dwjtq"],["衣服","fjjqq"],["鞋子","awlqq"],["颜色","frjlq"],["红色","ttjlq"],["蓝色","awjlq"],["绿色","ttjlq"],["白色","gtjlq"],["黑色","wtjlq"],["春天","qqqdr"],["夏天","dsqdr"],["秋天","mwqdr"],["冬天","jrqdr"],["太阳","drlsq"],["月亮","jqfsh"],["星星","sdsdq"],["下雨","aralr"],["刮风","mwjer"],["喜欢","kstrj"],["知道","mdrmg"],["觉得","rregs"],["希望","efftj"],["需要","qhalw"],["开始","qdtmt"],["结束","ttata"],["完成","rhdtt"]]};
+
+const KEYS = ['q','w','e','r','t','a','s','d','f','g','h','j','k','l','m'];
+const NAME = {q:'一',w:'丨',e:'丿',r:'丶',t:'乛',a:'十',s:'口',d:'厂',f:'亠',g:'亻',h:'讠',j:'勹',k:'扌',l:'了',m:'禾头'};
+const ROWS = [['q','w','e','r','t'],['a','s','d','f','g'],['h','j','k','l','m']];
+
+let mode = 'char';         // char | word
+let list = [];             // 当前题库
+let cursor = 0;
+let cur = null;            // [text, code]
+let typed = '';
+let score = 0, total = 0, right = 0, streak = 0;
+let t0 = null, doneCount = 0;
+
+const $ = id => document.getElementById(id);
+const target = $('target'), hint = $('hint'), entry = $('entry'), fb = $('fb');
+
+function shuffle(a){ for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; }
+
+function rebuild(){
+  if(mode === 'char'){
+    list = DATA.chars.slice(0, 500);
+  } else {
+    list = DATA.words.slice();
+  }
+  shuffle(list);
+  cursor = 0;
+  next();
+}
+
+function next(){
+  if(cursor >= list.length){ shuffle(list); cursor = 0; }
+  cur = list[cursor++];
+  typed = '';
+  target.textContent = cur[0];
+  target.classList.toggle('small', cur[0].length > 1);
+  // 提示：单字/词组显示每个码对应的部件名；认键模式不提示（否则等于给答案）
+  hint.innerHTML = cur[1].split('').map((c,i)=>
+    `<span class="${i<typed.length?'ok':''}">${NAME[c]}</span>`).join('');
+  entry.textContent = '';
+  fb.textContent = '';
+  fb.className = 'feedback';
+}
+
+function bump(){
+  const now = Date.now();
+  if(!t0) t0 = now;
+}
+
+function finish(ok){
+  total++;
+  if(ok){ right++; streak++; score += 10 + streak*2; }
+  else { streak = 0; score = Math.max(0, score - 5); }
+  doneCount++;
+  const el = (Date.now() - t0)/1000/60;
+  $('score').textContent = score;
+  $('acc').textContent = total ? Math.round(right/total*100)+'%' : '—';
+  $('spd').textContent = el > 0.02 ? (doneCount/el).toFixed(0)+' 字/分' : '—';
+  $('streak').textContent = streak;
+  setTimeout(next, ok ? 220 : 900);
+}
+
+function press(k){
+  bump();
+  if(!cur) return;
+  const want = cur[1][typed.length];
+  const key = document.querySelector(`.key[data-k="${k}"]`);
+  if(key){ key.classList.add('down'); setTimeout(()=>key.classList.remove('down'), 90); }
+  if(k === want){
+    typed += k;
+    entry.innerHTML = typed.split('').map(c=>`<span class="ok" style="color:#34c759">${c}</span>`).join('');
+    hint.innerHTML = cur[1].split('').map((c,i)=>
+      `<span class="${i<typed.length?'ok':(i===typed.length?'cur':'')}">${NAME[c]}</span>`).join('');
+    if(typed.length === cur[1].length){
+      fb.textContent = '✓';
+      finish(true);
+    }
+  } else {
+    entry.innerHTML = typed.split('').map(c=>`<span class="ok" style="color:#34c759">${c}</span>`).join('') +
+      `<span class="bad">${k}</span>`;
+    fb.textContent = '✗ 正确：' + cur[1] + '（' + cur[1].split('').map(c=>NAME[c]).join('') + '）';
+    fb.className = 'feedback bad';
+    finish(false);
+  }
+}
+
+function buildKb(){
+  const kb = $('kb');
+  ROWS.forEach((row, ri) => {
+    const div = document.createElement('div');
+    div.className = 'row';
+    row.forEach(k => {
+      const b = document.createElement('button');
+      b.className = 'key';
+      b.dataset.k = k;
+      b.innerHTML = `<span class="ch">${NAME[k]}</span><small>${k}</small>`;
+      b.onclick = () => press(k);
+      div.appendChild(b);
+    });
+    kb.appendChild(div);
+  });
+  const fr = document.createElement('div');
+  fr.className = 'row';
+  [['跳过','skip'],['重新开始','reset']].forEach(([t, a]) => {
+    const b = document.createElement('button');
+    b.className = 'func';
+    b.textContent = t;
+    b.onclick = () => {
+      if(a === 'skip'){ typed=''; next(); }
+      else { score=0;total=0;right=0;streak=0;doneCount=0;t0=null; $('score').textContent=0;
+             $('acc').textContent='—'; $('spd').textContent='—'; $('streak').textContent=0; rebuild(); }
+    };
+    fr.appendChild(b);
+  });
+  kb.appendChild(fr);
+}
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if(KEYS.includes(k)){ e.preventDefault(); press(k); }
+  else if(e.key === 'Escape'){ typed=''; next(); }
+});
+
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+    t.classList.add('on');
+    mode = t.dataset.m;
+    score=0;total=0;right=0;streak=0;doneCount=0;t0=null;
+    $('score').textContent=0;$('acc').textContent='—';$('spd').textContent='—';$('streak').textContent=0;
+    rebuild();
+  };
+});
+
+buildKb();
+rebuild();
+</script>
+</body>
+</html>
